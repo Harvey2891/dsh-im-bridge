@@ -86,6 +86,7 @@ export class ImRuntime extends Service {
     this.channels = new Map();
     this.lastUserTexts = new Map(); // sessionId → 最近一条用户文本（重试用，FR-5.6）
     this._lastFullOutput = new Map(); // sessionId → 最近 turn 的完整输出（/log 用）
+    this.agentHandles = new Map(); // sessionId → AgentHandle（释放 agent 的唯一途径）
     this.log = ctx.logger('im');
     this._dispose = [];
     this._ready = this.init();
@@ -420,8 +421,18 @@ export class ImRuntime extends Service {
     this.emit('im/dispatch', { sessionId: binding.sessionId, platform, chatId, text });
   }
 
-  createBinding(platform, chatId, chatType) {
-    return this.map.create(platform, chatId, { chatType });
+  createBinding(platform, chatId, chatType, sessionId) {
+    return this.map.create(platform, chatId, { chatType, sessionId });
+  }
+
+  /**
+   * `/new` 用的新会话 id：在确定性 id 基础上加时间戳后缀。
+   * 必须换 id —— 确定性 id 对应的会话日志已持久化在磁盘上，
+   * 再用同一 id 去 create 会抛 `session "<id>" already exists`。
+   * 映射会记住新 id，所以重启后仍能 resume 到最新会话。
+   */
+  freshSessionId(platform, chatId) {
+    return `${sessionIdFor(platform, chatId)}-${Date.now().toString(36)}`;
   }
 
   async tryResume(sessionId) {
@@ -430,6 +441,9 @@ export class ImRuntime extends Service {
         resumeSessionId: sessionId,
         agentOptions: await this.agentOptions(),
       });
+      // 同样要记住 handle：resume 出来的 agent 也只有 handle 能释放（见 disposeAgent）。
+      // 漏了这一步，重启后 resume 的会话在 /new 时无法释放。
+      this.agentHandles.set(sessionId, handle);
       return handle.agent;
     } catch (err) {
       this.log.warn(`resume ${sessionId} failed (will create fresh) | 恢复会话失败（将新建）: ${err.message}`);
@@ -444,7 +458,25 @@ export class ImRuntime extends Service {
       meta: { cwd: this.workspace() },
       agentOptions: options,
     });
+    // 记住 handle：释放 agent 只能通过 handle.dispose()（agents 服务没有 dispose 方法）。
+    // 没有这一步，/new 无法释放旧 agent，确定性 sessionId 会永远冲突
+    // （`session "<id>" already exists`）。
+    this.agentHandles.set(sessionId, handle);
     return handle.agent;
+  }
+
+  /** 释放某个会话的 agent（幂等）。仅 handle 能释放，服务层无此能力。 */
+  async disposeAgent(sessionId) {
+    const handle = this.agentHandles.get(sessionId);
+    if (!handle) return false;
+    this.agentHandles.delete(sessionId);
+    try {
+      await handle.dispose();
+      return true;
+    } catch (err) {
+      this.log.warn(`dispose agent ${sessionId} failed | 释放 agent 失败: ${err.message}`);
+      return false;
+    }
   }
 
   async agentOptions() {
@@ -587,6 +619,9 @@ export class ImRuntime extends Service {
         await this.send({ platform, chatId }, { text: '⏳ 当前会话仍在运行，先等它结束或取消后再新建。' });
         return;
       }
+      // 释放旧 agent：它只要还活在 session store 里，同名会话就会冲突。
+      // 注意仅 handle 能释放（agents 服务没有 dispose 方法），见 disposeAgent。
+      await this.disposeAgent(existing.sessionId);
       this.map.remove(platform, chatId);
     }
     if (this.map.size >= cfg.maxSessions) {
@@ -595,7 +630,11 @@ export class ImRuntime extends Service {
       });
       return;
     }
-    const binding = this.createBinding(platform, chatId, msg.chatType ?? 'private');
+    // ⚠️ /new 必须换一个**新的** session id。确定性 id（im-<platform>-<chatId>）
+    // 对应的会话日志已持久化在磁盘上，即使旧 agent 已释放，再用同一 id 去
+    // create 仍会抛 `session "<id>" already exists`。
+    const newSessionId = this.freshSessionId(platform, chatId);
+    const binding = this.createBinding(platform, chatId, msg.chatType ?? 'private', newSessionId);
     await this.createAgent(binding.sessionId);
     await this.send({ platform, chatId }, {
       text: `✅ 新会话已创建（${binding.sessionId}）。\n直接发送任务即可，例如：\n> 跑一下 tests 目录的 pytest`,

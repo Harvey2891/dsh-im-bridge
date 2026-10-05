@@ -82,22 +82,27 @@ export class SessionMap {
     return this.chats.has(chatKey(platform, chatId));
   }
 
-  /** 创建绑定（会话 id 确定性生成）。 */
-  create(platform, chatId, { chatType = 'private' } = {}) {
+  /**
+   * 创建绑定。
+   * 默认会话 id 确定性生成（重启不变）。传入 sessionId 可显式指定——
+   * `/new` 必须用它：确定性 id 会与磁盘上已持久化的同名会话冲突
+   * （`session "<id>" already exists`），导致 /new 永远失败。
+   */
+  create(platform, chatId, { chatType = 'private', sessionId } = {}) {
     const key = chatKey(platform, chatId);
-    const sessionId = sessionIdFor(platform, chatId);
+    const id = sessionId ?? sessionIdFor(platform, chatId);
     if (this.chats.has(key)) return this.chats.get(key);
     const binding = {
       platform,
       chatId: String(chatId),
       chatType,
-      sessionId,
+      sessionId: id,
       createdAt: Date.now(),
       lastActivityAt: Date.now(),
       users: new Map(),
     };
     this.chats.set(key, binding);
-    this.bySession.set(sessionId, key);
+    this.bySession.set(id, key);
     this._scheduleSave();
     return binding;
   }
