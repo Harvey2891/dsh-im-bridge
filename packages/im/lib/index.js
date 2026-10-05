@@ -69,6 +69,10 @@ const Config = z.object({
     provider: z.string().default(''),                  // 空 → 用 agentDefaultModel 或内置默认
     model: z.string().default(''),
     workspace: z.string().default(''),                 // 空 → process.cwd()
+    // IM 会话使用的 agent preset id。
+    // 必须挂载 preset，否则 agent 拿不到文件/shell 工具（read/write/edit/glob/grep/pwsh）——
+    // 这些工具声明在 preset 里，不是根级插件。缺它时 IM 会话「读不了文件」。
+    preset: z.string().default('standard'),
   }),
   storeDir: z.string().default(''),                    // 空 → $DSH_HOME/dsh-im
 });
@@ -453,10 +457,29 @@ export class ImRuntime extends Service {
 
   async createAgent(sessionId) {
     const options = await this.agentOptions();
+    const presetId = this.cfg.agent.preset || 'standard';
     const handle = await this.ctx.agents.create({
       sessionId,
-      meta: { cwd: this.workspace() },
+      meta: { cwd: this.workspace(), agentPreset: presetId },
       agentOptions: options,
+      // ⚠️ 必须挂载 agent preset：文件/shell 工具（read/write/edit/glob/grep/pwsh）
+      // 都由 preset 声明。不挂载时 agent 只剩根级插件贡献的工具（agent-team/
+      // schedule/skill），表现为「IM 会话没有文件读取权限」——实为工具未装载。
+      // 官方 webhook 运行时与本仓库 registry 测试用的都是同样的 setup 写法。
+      // 用 ctx.get（而非 ctx.agentPresets 属性代理）：本包 inject 未声明该服务，
+      // 属性代理对拓扑敏感，严格读取应走全局服务存储（见 DSH packages/AGENTS.md）。
+      setup: async (agentCtx) => {
+        const presets = this.ctx.get('agentPresets');
+        if (!presets) {
+          this.log.error(
+            `agentPresets service unavailable — IM agent "${sessionId}" was created WITHOUT tools | `
+            + 'agentPresets 服务不可用，该 IM 会话未挂载任何工具（文件/shell 工具不可用）。'
+            + ` 请确认 profile 已加载 agent preset registry，且 preset "${presetId}" 存在。`,
+          );
+          return;
+        }
+        await presets.mount(agentCtx, presetId);
+      },
     });
     // 记住 handle：释放 agent 只能通过 handle.dispose()（agents 服务没有 dispose 方法）。
     // 没有这一步，/new 无法释放旧 agent，确定性 sessionId 会永远冲突

@@ -86,6 +86,16 @@ async function setup(script, cfgOverrides = {}) {
   await mountAgentLoopTestDependencies(ctx);
   ctx.plugin(ApprovalService, { policy: 'ask' });
   ctx.plugin(AgentLoop, { agents: [] });
+  // 间谍：testkit 不提供官方 agentPresets 注册表，这里记录挂载调用。
+  // IM agent 若不挂载 preset，就拿不到文件/shell 工具（read/write/edit/glob/grep/pwsh），
+  // 表现为「IM 会话读不了文件」—— 这是 issue 的回归点。
+  const presetMounts = [];
+  ctx.provide('agentPresets', {
+    mount: async (_agentCtx, presetId) => {
+      presetMounts.push(presetId);
+      return { id: presetId };
+    },
+  });
   const adapter = new ScriptedAdapter(script);
   ctx.get('llm').registerAdapter(['mock-llm'], adapter);
 
@@ -111,12 +121,63 @@ async function setup(script, cfgOverrides = {}) {
     mock,
     adapter,
     im,
+    presetMounts,
     teardown: async () => {
       await imHandle?.dispose?.();
       await ctx.get('llm')?.dispose?.();
     },
   };
 }
+
+// ── 回归：IM agent 必须挂载 agent preset ────────────────────────────────────
+//
+// 症状：钉钉/飞书会话里 agent 无法读取文件。
+// 根因：dsh-im 创建 agent 时既没传 meta.agentPreset，也没用 setup 挂载 preset。
+//       文件与 shell 工具（tool-fs / tool-fs-search / tool-pwsh）都声明在 preset 里，
+//       不是根级插件贡献的 —— 于是 IM 会话只剩 agent-team/schedule/skill 那几个工具。
+//       实测对照：未挂载时 15 个工具（无一个文件工具），挂载后 37 个。
+// 修复：createAgent 传 meta.agentPreset 并在 setup 里 agentPresets.mount。
+
+test('回归：派活时必须挂载 agent preset（否则 IM 会话没有文件/shell 工具）', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: '收到' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, presetMounts, teardown } = await setup(script);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => presetMounts.length > 0, { label: 'agentPresets.mount', timeoutMs: 8000 });
+    assert.ok(
+      presetMounts.includes('standard'),
+      'IM agent 必须挂载 standard preset；不挂载则没有 read/write/edit/glob/grep/pwsh',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：agent.preset 可配置（非 standard 时按配置挂载）', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: '收到' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, presetMounts, teardown } = await setup(script, { agent: { preset: 'minimal' } });
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => presetMounts.length > 0, { label: 'agentPresets.mount', timeoutMs: 8000 });
+    assert.deepEqual(presetMounts, ['minimal'], '应按配置的 preset id 挂载');
+  } finally {
+    await teardown();
+  }
+});
 
 test('派活 → 审批 → 放行 → 结果卡片（全链路）', async () => {
   const script = [
