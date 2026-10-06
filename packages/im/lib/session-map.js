@@ -48,6 +48,9 @@ export class SessionMap {
           sessionId: entry.sessionId,
           createdAt: entry.createdAt ?? Date.now(),
           lastActivityAt: entry.lastActivityAt ?? 0,
+          // 恢复 `/mute` 状态（round-n1 F14）
+          muted: entry.muted === true,
+          mutedBy: entry.mutedBy ?? '',
           /** Map<userId, {name, lastActiveAt}> */
           users: new Map(),
         };
@@ -204,6 +207,9 @@ export class SessionMap {
           sessionId: b.sessionId,
           createdAt: b.createdAt,
           lastActivityAt: b.lastActivityAt,
+          // `/mute` 的状态必须持久化，否则重启即失效（round-n1 F14 连带问题）
+          muted: b.muted === true,
+          mutedBy: b.mutedBy ?? '',
           users: [...b.users.entries()].map(([userId, u]) => ({ userId, name: u.name, lastActiveAt: u.lastActiveAt })),
         })),
         allowlist: [...this.allowlist],

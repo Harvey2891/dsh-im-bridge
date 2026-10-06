@@ -572,8 +572,8 @@ test('回归：混合题型（有选项 + 自由文本）不得被按钮自动�
     // round-4 发现：含自由文本题时不能自动结题，否则该题被伪造成空答案
     assert.equal(im.userQuestions.records.size, 1, '含自由文本题时必须继续等待');
     assert.ok(
-      mock.sent.some((m) => m.text?.includes('自由文本题')),
-      '应告知按钮无法完成该题',
+      mock.sent.some((m) => m.text?.includes('text <内容>')),
+      '应告知按钮无法完成文字题、需要用显式 text 语法',
     );
   } finally {
     await teardown();
@@ -802,6 +802,102 @@ test('回归：retry 回调必须过权限与归属校验', async () => {
       mock.sent.some((m) => m.text?.includes('无权限')),
       '未授权用户 retry 必须被拒',
     );
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：未授权首条消息不得创建会话绑定（F10，不得绕过 autoCreate/maxSessions）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    const before = im.map.size;
+    // 陌生用户先说话 → 只应记录"最近发言者"，不应建绑定
+    await mock.sendFromUser({ text: '你好', userId: 'stranger' });
+    assert.equal(im.map.size, before, '未授权用户不得占用绑定名额');
+    assert.ok(
+      im.lastSeen.get('mock:chat-1')?.userId === 'stranger',
+      '但仍须记住发言者，供出站带 userId',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：多选按钮不得在第一次点击就结题（F06）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选几个？', options: [{ label: 'a' }, { label: 'b' }, { label: 'c' }], multiSelect: true },
+    ]);
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'user-1', userName: 'T', data: `q:${qid}:0:0`,
+    });
+    // 第一次点击后必须仍在等待，否则用户无法再选第二项
+    assert.equal(im.userQuestions.records.size, 1, '多选题第一次点击后应继续等待');
+
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'user-1', userName: 'T', data: `q:${qid}:0:2`,
+    });
+    assert.equal(im.userQuestions.records.size, 1, '仍未 done，继续等待');
+
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, 'done']);
+    const ans = await p;
+    assert.deepEqual(ans.answers, [{ id: 'q1', selected: ['a', 'c'] }], '多选应累计两项');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：/answer 空格分隔与直接回数字口径一致（F07）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+      { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+    ]);
+    // 空格分隔的两个 token 必须等价于 `/answer <id> 1.1,2.2`
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '1.1', '2.2']);
+    const ans = await p;
+    assert.deepEqual(ans.answers, [
+      { id: 'q1', selected: ['a1'] },
+      { id: 'q2', selected: ['b2'] },
+    ]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：/mute 必须真的静默通知（F14）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    const binding = im.map.get('mock', 'chat-1');
+
+    await im.commandMute({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, true);
+    assert.equal(binding.muted, true, '状态应写入');
+
+    mock.reset();
+    // 走真实的流式通知路径：appendStream + flush(force)
+    const st = im.notify.state(binding.sessionId);
+    im.notify.appendStream(binding, 'x'.repeat(80));
+    await im.notify.flush(st, true);
+    assert.equal(
+      mock.sent.filter((m) => m.text?.includes('xxxx')).length, 0,
+      '/mute 后普通通知必须被静默（此前 muted 从不被读取）',
+    );
+
+    await im.commandMute({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, false);
+    const st2 = im.notify.state(binding.sessionId);
+    im.notify.appendStream(binding, 'y'.repeat(80));
+    await im.notify.flush(st2, true);
+    assert.ok(mock.sent.some((m) => m.text?.includes('yyyy')), 'unmute 后应恢复推送');
   } finally {
     await teardown();
   }

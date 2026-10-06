@@ -165,6 +165,15 @@ export class ApprovalManager {
     record.decided = record.resolve;
     this.records.set(approvalId, record);
 
+    // 🔴 abort 监听必须**先于** send 注册：send 是 await 的，若注册在它之后，
+    // 发送期间发生的会话取消就无人处理 —— 记录停在 waiting、旧卡片仍可点
+    // （round-n1 F11）。这里还额外处理"注册时已经 aborted"的情形。
+    if (req.signal?.aborted) {
+      record.resolve('cancelled');
+      return outcome;
+    }
+    req.signal?.addEventListener('abort', () => record.resolve('cancelled'), { once: true });
+
     const card = this.renderCard(record);
     try {
       await this.send({ platform: binding.platform, chatId: binding.chatId }, card);
@@ -190,9 +199,6 @@ export class ApprovalManager {
         }).catch(() => {});
       }, this.pendingMaxSec * 1000);
     }, this.timeoutSec * 1000);
-
-    // 会话取消 → cancelled
-    req.signal?.addEventListener('abort', () => record.resolve('cancelled'), { once: true });
 
     return outcome;
   }

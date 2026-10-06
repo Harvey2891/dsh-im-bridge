@@ -22,7 +22,7 @@ import { chatKey, userKey, parseUserKey, sessionIdFor } from './message.js';
 import { validateAdapterContract } from './channel.js';
 import { SessionMap } from './session-map.js';
 import { registerCommand, parseCommand, helpText, commands } from './commands.js';
-import { markdownToText, splitLongText, summarizeLongOutput, splitByBytes } from './renderer.js';
+import { markdownToText, summarizeLongOutput, splitByBytes } from './renderer.js';
 import { ApprovalManager } from './approvals.js';
 import { NotifyBus } from './notify.js';
 import { UserQuestionAnswerer } from './user-questions.js';
@@ -112,6 +112,9 @@ export class ImRuntime extends Service {
     this.channels = new Map();
     this.lastUserTexts = new Map(); // sessionId → 最近一条用户文本（重试用，FR-5.6）
     this._lastFullOutput = new Map(); // sessionId → 最近 turn 的完整输出（/log 用）
+    // chatKey → { userId, userName, at }：最近在**该聊天**发言的人。
+    // 供出站取平台 userId，同时**不**创建会话绑定（避免绕过 autoCreate/maxSessions，F10）
+    this.lastSeen = new Map();
     this.agentHandles = new Map(); // sessionId → AgentHandle（释放 agent 的唯一途径）
     this.log = ctx.logger('im');
     this._dispose = [];
@@ -268,6 +271,10 @@ export class ImRuntime extends Service {
       }
       userId = newest;
     }
+    // 绑定可能尚未建立（首条消息、或 autoCreate=false）→ 回退到最近发言者表。
+    // 这张表只存"谁刚在这个聊天里说过话"，不构成会话绑定，因此不触碰
+    // autoCreate / maxSessions 两道保护（round-n1 F10）。
+    if (!userId) userId = this.lastSeen.get(chatKey(platform, chatId))?.userId;
     const body = { ...out, platform, chatId, ...(userId ? { userId } : {}) };
 
     // 🔴 出站文本必须**只有一处**生成（单一真源），否则预算与实发不符。
@@ -302,28 +309,44 @@ export class ImRuntime extends Service {
 
     // 前缀 `(i/n) ` 的字节数是 `digits(i)+digits(n)+4`，随段数增长：
     // 固定 12 字节在 5 位段数（>9999 段）时不敷。这里按实际段数迭代求出预留量。
-    // 只切分**正文**；命令块独立处理，保证不被切开。
+    // 🔴 只切**正文**：`mainText || full` 在正文为空时会去切**命令块**，
+    // 然后命令块又被独立发一遍 —— 命令既被切开又重复（round-n1 F08）。
     let reserve = 8;
-    let parts = splitByBytes(mainText || full, Math.max(1, maxBytes - reserve));
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const need = String(parts.length + 1).length * 2 + 4;
-      if (need <= reserve) break;
-      reserve = need;
-      parts = splitByBytes(mainText || full, Math.max(1, maxBytes - reserve));
+    let parts = [];
+    if (mainText) {
+      parts = splitByBytes(mainText, Math.max(1, maxBytes - reserve));
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const need = String(parts.length + 1).length * 2 + 4;
+        if (need <= reserve) break;
+        reserve = need;
+        parts = splitByBytes(mainText, Math.max(1, maxBytes - reserve));
+      }
     }
 
-    // 命令块整体作为**独立末段**：正文末段通常已接近预算上限，把命令并进去
-    // 会重新超限（实测 300 上限得到 356 字节），所以只要发生分段就让命令独占一段。
-    const cmdOwnSegment = !!commands;
-    const total = parts.length + (cmdOwnSegment ? 1 : 0);
+    // 命令块按**整行**分组：一条命令绝不能被切开（切开的命令无法复制/执行）。
+    // 单行本身就超预算时，宁可让它独占一条（略超限）也不切 —— 保可执行性优先。
+    const cmdSegments = [];
+    if (commands) {
+      let cur = '';
+      for (const line of String(commands).split('\n')) {
+        const cand = cur ? `${cur}\n${line}` : line;
+        if (cur && Buffer.byteLength(cand, 'utf8') > maxBytes) {
+          cmdSegments.push(cur);
+          cur = line;
+        } else {
+          cur = cand;
+        }
+      }
+      if (cur) cmdSegments.push(cur);
+    }
 
+    const total = parts.length + cmdSegments.length;
     let last;
     // 附件与按钮都必须**恰好投递一次**，且都在整体最后一条消息上。
     // 🔴 此前文本型渠道（cmdOwnSegment=true）时 lastBodyIdx=-1 使每段都清附件，
     // 命令末段也清 —— 结果**没有任何一次**携带附件，附件静默消失（round-n1 F03）。
     // 按钮只出现在末段：每段都带会让用户点到已失效的按钮（返回 not-found）。
-    const carried = body.buttons?.length ? 'buttons' : (body.attachments?.length ? 'attachments' : null);
-    const lastDispatchIdx = cmdOwnSegment ? total - 1 : parts.length - 1;
+    const lastDispatchIdx = total - 1;
     let dispatchIdx = -1;
     for (let i = 0; i < parts.length; i++) {
       dispatchIdx += 1;
@@ -334,20 +357,15 @@ export class ImRuntime extends Service {
         ...(isLastDispatch ? {} : { buttons: undefined, attachments: undefined }),
       });
     }
-    if (cmdOwnSegment) {
-      const cmdParts = splitByBytes(commands, Math.max(1, maxBytes - reserve));
-      for (let j = 0; j < cmdParts.length; j++) {
-        dispatchIdx += 1;
-        const isLastDispatch = dispatchIdx === lastDispatchIdx;
-        last = await this._dispatch(channel, {
-          ...body,
-          text: `(${parts.length + j + 1}/${total}) ${cmdParts[j]}`,
-          ...(isLastDispatch ? {} : { buttons: undefined, attachments: undefined }),
-        });
-      }
+    for (let j = 0; j < cmdSegments.length; j++) {
+      dispatchIdx += 1;
+      const isLastDispatch = dispatchIdx === lastDispatchIdx;
+      last = await this._dispatch(channel, {
+        ...body,
+        text: `(${parts.length + j + 1}/${total}) ${cmdSegments[j]}`,
+        ...(isLastDispatch ? {} : { buttons: undefined, attachments: undefined }),
+      });
     }
-    // 若最后一条本应携带按钮/附件却没有对应字段，属调用方问题；这里不额外补救。
-    void carried;
     return last;
   }
 
@@ -394,12 +412,18 @@ export class ImRuntime extends Service {
     }
     if (!this.map.dedupe(platform, msg.msgId)) return; // FR-1.4 幂等去重
 
-    // 先记录发言者：出站要带平台 userId（钉钉主动推送必须用它），而 send() 从
-    // 会话映射读取。必须早于任何回复，否则首条消息（如首接触提示）会缺 userId。
-    // touch 只在已有绑定时生效；首条消息可能尚未建绑定，故缺失时先建绑定。
-    if (!this.map.get(platform, chatId)) {
-      this.map.create(platform, chatId, { chatType: msg.chatType ?? 'private' });
-    }
+    // 记录发言者，供出站取平台 userId（钉钉主动推送必须用它）。
+    //
+    // 🔴 这里**不能建会话绑定**：绑定代表「已建立会话」，创建它会绕过
+    // `autoCreate=false` 与 `maxSessions` 两道保护（round-n1 F10 —— 未授权聊天
+    // 也会先占一个绑定名额，授权用户的 `/new` 可能被上限阻断）。
+    // 改为核心自持一张轻量「最近发言者」表，与正式会话绑定解耦。
+    this.lastSeen.set(chatKey(platform, chatId), {
+      userId: String(userId),
+      userName: msg.userName,
+      at: Date.now(),
+    });
+    // 已有绑定时照旧刷新（在线判定与 users 列表仍依赖它）
     this.map.touch(platform, chatId, userId, msg.userName);
 
     // FR-8.2：allowlist 之外的用户「可读不可写」→ 派活/命令一律拒绝（admins 隐式放行）
@@ -525,9 +549,11 @@ export class ImRuntime extends Service {
         if (acc.status === 'partial') {
           // 🔴 混合题型的文字题必须用**显式**语法：普通文字在该卡里会按新任务处理，
           // 这里若仍写"请直接回复文字"会把用户导向错误入口（round-n1 F09）。
-          const hint = acc.needsText
-            ? `\n该卡片含**自由文本题**，按钮无法作答——请发 \`/answer ${qid} text <内容>\` 回答文字题，`
-              + `或发 \`/answer ${qid} done\` 提交当前选择。`
+          const needs = [];
+          if (acc.needsText) needs.push(`发 \`/answer ${qid} text <内容>\` 回答文字题`);
+          if (acc.needsDone) needs.push('多选题可继续点，完成后发 `/answer ${qid} done` 提交');
+          const hint = needs.length
+            ? `\n${needs.join('；')}。`
             : `\n进度 ${acc.answered}/${acc.total}——继续点其余题，或发 \`/answer ${qid} done\` 直接提交。`;
           return reply(
             `📝 已记录提问 #${qid} 的第 ${(Number(qIdxRaw) || 0) + 1} 题：${acc.label ?? ''}${hint}`,
@@ -856,10 +882,19 @@ export class ImRuntime extends Service {
     });
     registerCommand('answer', {
       perm: 'user',
-      usage: '<id> <编号>[,<编号>] | skip',
-      desc: '回答 agent 的提问（无按钮渠道降级路径）；skip 跳过让 agent 自行决定',
-      descEn: 'answer an agent question by option number, or skip',
+      usage: '<id> <编号>[,<编号>] | text <内容> | skip | done',
+      desc: '回答 agent 的提问（无按钮渠道降级路径）；text 回答文字题，done 提交已选，skip 跳过',
+      descEn: 'answer an agent question by option number, free text, or skip/done',
       run: (c, args) => c.core.commandAnswer(c.msg, args),
+    });
+    // 错误卡片上的「🔁 重试」按钮需要一条**可执行**的文本命令：钉钉等渠道
+    // 拿不到内联按钮，只会把按钮降级成一行提示文字（round-n1 F12）。
+    registerCommand('retry', {
+      perm: 'user',
+      usage: '',
+      desc: '重试本会话最近一次失败的任务',
+      descEn: 'retry the last failed task in this chat',
+      run: (c) => c.core.commandRetry(c.msg),
     });
     registerCommand('trust', {
       perm: 'admin',
@@ -981,15 +1016,43 @@ export class ImRuntime extends Service {
       }
       return;
     }
-    // 无 sendFile 的渠道：长文本分段发送
-    const chunks = splitLongText(markdownToText(full), { maxChunks: 6 });
-    for (const chunk of chunks) {
-      await this.send({ platform: msg.platform, chatId: msg.chatId }, { text: chunk });
+    // 无 sendFile 的渠道：长文本分段发送。
+    // 🔴 不能限 `maxChunks`：那会让 `/log` 只发前几段，而截断提示又写着"用 /log 取全文"
+    // —— 而 /log 正是这条路，用户**永远拿不到全文**（round-n1 F15）。
+    // 这里按字节预算切分并**全量**发送，不设段数上限。
+    const maxBytes = this.channels.get(msg.platform)?.maxMessageBytes ?? 3500;
+    const chunks = splitByBytes(markdownToText(full), maxBytes);
+    const total = chunks.length;
+    if (total > 1) {
+      await this.send({ platform: msg.platform, chatId: msg.chatId }, {
+        text: `📜 完整输出共 ${total} 段，正在全部发送…`,
+      });
+    }
+    for (let i = 0; i < total; i++) {
+      const seq = total > 1 ? `(${i + 1}/${total}) ` : '';
+      await this.send({ platform: msg.platform, chatId: msg.chatId }, { text: `${seq}${chunks[i]}` });
     }
   }
 
   async commandHelp(msg) {
     await this.send({ platform: msg.platform, chatId: msg.chatId }, { text: helpText() });
+  }
+
+  /**
+   * `/retry`：重试本会话最近一次失败的任务。
+   * 与错误卡片上的 `retry:<sessionId>` 按钮等价，供无内联按钮的渠道（钉钉）使用。
+   * 权限与归属由命令门（perm: 'user'）与本会话绑定共同保证。
+   */
+  async commandRetry(msg) {
+    const chat = { platform: msg.platform, chatId: msg.chatId };
+    const binding = this.map.get(msg.platform, msg.chatId);
+    if (!binding) return this.send(chat, { text: 'ℹ️ 尚未创建会话。' });
+    const text = this.lastUserTexts.get(binding.sessionId);
+    if (!text) return this.send(chat, { text: 'ℹ️ 没有可重试的任务。' });
+    const agent = this.ctx.agents.get(binding.sessionId);
+    if (!agent) return this.send(chat, { text: 'ℹ️ 会话不在线（重启后需先发一条消息恢复）。' });
+    agent.followup(this.userMessage(text));
+    return this.send(chat, { text: '🔁 已重新提交任务。' });
   }
 
   async commandMute(msg, muted) {
@@ -1038,7 +1101,9 @@ export class ImRuntime extends Service {
     if (!id || !picksRaw) {
       return this.send(chat, {
         text: '用法：/answer <id> <编号>[,<编号>] [自定义文字]\n'
+          + '      /answer <id> text <内容>  回答自由文本题\n'
           + '      /answer <id> skip        跳过选择，让 agent 自行决定\n'
+          + '      /answer <id> done        提交当前已选（配合按钮逐题点选）\n'
           + '例：/answer 01 2   或   /answer 01 1.1,1.3   （编号见提问卡片）',
       });
     }
@@ -1108,10 +1173,21 @@ export class ImRuntime extends Service {
     }
 
     const multi = rec.questions.length > 1;
-    // 分隔符与入站劫持正则保持一致：`,`、中文逗号、空白都接受
-    // （此前入站接受 `1 2`/`1，2` 并劫持消息，这里却只 split(',')，导致整条消息被吞掉后报"编号无效"）
+    // 🔴 分隔符口径必须与入站劫持**完全一致**：`parseCommand` 按空白切分 args，
+    // 于是 `/answer 01 1 2` 的 `2` 会落到 customParts；而直接回「1 2」在入站被
+    // 当作两个编号。此前两条路径行为不同，用户按提示操作会报"编号无效"
+    // （round-n1 F07）。修法：把 customParts **开头连续的纯编号 token** 并入 picks，
+    // 遇到第一个非编号 token 起才是自定义文字。
+    const isPickToken = (s) => /^\d+(\.\d+)?$/.test(s);
+    const tokens = [String(picksRaw)];
+    let ci = 0;
+    while (ci < customParts.length && isPickToken(customParts[ci])) {
+      tokens.push(customParts[ci]);
+      ci += 1;
+    }
+    const restCustom = customParts.slice(ci);
     const picks = [];
-    for (const token of String(picksRaw).split(/[,，\s]+/)) {
+    for (const token of tokens.join(' ').split(/[,，\s]+/)) {
       const t = token.trim();
       if (!t) continue;
       if (multi && t.includes('.')) {
@@ -1126,10 +1202,13 @@ export class ImRuntime extends Service {
       return this.send(chat, { text: '⚠️ 编号无效，请按卡片上的编号回复。' });
     }
 
-    const custom = customParts.length ? customParts.join(' ') : undefined;
+    const custom = restCustom.length ? restCustom.join(' ') : undefined;
+    // 🔴 编号路径**不再**因 continued 就允许部分作答：`allowPartial` 的本意是
+    // "按钮一次只带一个 (q,o)"，用在文字命令上会让 `done` 之外的命令**提前提交
+    // 未完成的卡片**（round-n1 F05）。文字命令一律要求答全，或显式 done/skip。
     const result = this.userQuestions.respond(String(id), picks, custom, {
       platform: msg.platform, chatId: msg.chatId,
-    }, isContinued ? { allowPartial: true } : {});
+    });
     const texts = {
       answered: `✅ 已回答提问 #${id}，agent 继续。`,
       'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,

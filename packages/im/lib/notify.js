@@ -113,11 +113,17 @@ export class NotifyBus {
     if (now - last < 60_000) return; // 同类通知 1 分钟聚合
     this._lastPush.set(`${agent.id}:error`, now);
     const message = error instanceof Error ? error.message : String(error);
-    const text = `❌ Agent 出错：${message.slice(0, 800)}`;
     const lastUserText = this.lastUserTextFor(agent.id);
+    const text = `❌ Agent 出错：${message.slice(0, 800)}`
+      + (lastUserText ? '\n\n可点下方按钮重试，或直接发 `/retry`。' : '');
     void this.send({ platform: binding.platform, chatId: binding.chatId }, {
       text,
-      buttons: lastUserText ? [{ id: `retry:${agent.id}`, label: '🔁 重试', style: 'default' }] : undefined,
+      // 🔴 必须带 `command`：文本型渠道（如钉钉）拿不到内联按钮，会把按钮降级成
+      // 一行提示文字；没有 command 时那行文字**不可执行**，用户在钉钉里根本没法重试
+      // （round-n1 F12）。带上后可复制可执行。
+      buttons: lastUserText
+        ? [{ id: `retry:${agent.id}`, label: '🔁 重试', style: 'default', command: '/retry' }]
+        : undefined,
     }).catch((err) => this.log(`[notify] error push failed: ${err.message}`));
   }
 
@@ -167,16 +173,22 @@ export class NotifyBus {
       s.flushTimer = null;
     }
     const text = markdownToText(s.reservoir);
-    s.reservoir = '';
     if (!text) return;
-    if (force || text.length >= 40) {
-      await this.sendReservoir(s, text);
-    }
+    // 🔴 未达阈值时**不要清空** reservoir：此前先清空再判断长度，
+    // 短片段（<40 字）会被直接丢弃、永远发不出去（round-n1 F13）。
+    // 现在留在缓冲里继续累积，等下一次 flush 或 turn 结束（force）再发。
+    if (!force && text.length < 40) return;
+    s.reservoir = '';
+    await this.sendReservoir(s, text);
   }
 
   async sendReservoir(s, text) {
     const binding = this.map.bySessionId(s.sessionId);
     if (!binding) return;
+    // 🔴 `/mute` 此前只写 binding.muted 却**从不读取**，命令完全无效（round-n1 F14）。
+    // 静默只作用于**普通通知**；审批（走 ApprovalManager 自己的 send）不受影响，
+    // 与 `/mute` 的回复文案「审批仍会推送」保持一致。
+    if (binding.muted) return;
     const chunks = splitLongText(text);
     for (const chunk of chunks) {
       await this.send({ platform: binding.platform, chatId: binding.chatId }, { text: chunk });
@@ -232,7 +244,7 @@ export class NotifyBus {
     // 失败通知带重试按钮（FR-5.6）
     const lastUserText = this.lastUserTextFor(binding.sessionId);
     if (status === 'error' && lastUserText) {
-      out.buttons = [{ id: `retry:${binding.sessionId}`, label: '🔁 重试', style: 'default' }];
+      out.buttons = [{ id: `retry:${binding.sessionId}`, label: '🔁 重试', style: 'default', command: '/retry' }];
     }
     void this.send({ platform: binding.platform, chatId: binding.chatId }, out)
       .catch((err) => this.log(`[notify] result push failed: ${err.message}`));

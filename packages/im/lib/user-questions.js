@@ -365,11 +365,11 @@ export class UserQuestionAnswerer {
     const lastQ = picks.length ? picks[picks.length - 1].qIndex : 0;
     const label = rec.draft.get(lastQ)?.join('、') ?? '';
 
-    if (this._isComplete(rec)) {
+    if (this._isComplete(rec) && !this._hasMultiSelect(rec)) {
       const r = this._finish(rec, this._answersFromDraft(rec), { accumulated: true });
       return { status: r, answered, total: rec.questions.length, label };
     }
-    // 未答全：保持等待，回报进度（不是结题）
+    // 未答全**或含多选题**：保持等待，回报进度（不是结题）
     this.logLine(`question #${rec.id} partial ${answered}/${optionQs.length} (${label})`);
     return {
       status: 'partial',
@@ -378,7 +378,15 @@ export class UserQuestionAnswerer {
       label,
       // 还有自由文本题没填 → 提示用户用显式语法作答
       needsText: this._textQs(rec).some((qi) => !rec.draftCustom.has(qi)),
+      // 含多选题 → 按钮不自动结题，必须显式 done（否则第一次点击就提交，
+      // 用户无法再选第二项 —— round-n1 F06）
+      needsDone: this._hasMultiSelect(rec),
     };
+  }
+
+  /** 卡片里是否有多选题（多选题不能"点一下就自动提交"）。 */
+  _hasMultiSelect(rec) {
+    return rec.questions.some((q) => q.multiSelect === true);
   }
 
   /**
