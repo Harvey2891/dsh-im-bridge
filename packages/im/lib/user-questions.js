@@ -287,7 +287,12 @@ export class UserQuestionAnswerer {
       `不想选：回 \`skip\`（或 \`/answer ${record.id} skip\`），agent 会自行决定后继续。`,
       record.questions.length > 1
         ? `按钮可逐题点选：答全会自动提交；也可发 \`/answer ${record.id} done\` 提前提交（未答的题按跳过）。`
-        : '',
+        : record.questions.some((q) => q.multiSelect)
+          // 🔴 单题多选卡同样必须提示 done（新计轮 round-1 P2）：统一结题门下多选卡
+          // 永不自动提交，卡片不写清"要发 done"，用户按"直接回数字"操作后会撞进
+          // incomplete 状态，表现为"按钮没反应"。
+          ? `本卡含**多选题**：**不会自动提交**——选完请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔，如 \`1,3\`）。`
+          : '',
     );
 
     return { text: lines.join('\n'), buttons };

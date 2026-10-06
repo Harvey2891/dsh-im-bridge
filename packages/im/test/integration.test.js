@@ -993,6 +993,16 @@ test('回归：/mute 后错误卡与结果卡都被静默（round-2 P2-3）', as
       mock.sent.filter((m) => m.text?.includes('Agent 出错')).length,
       0, '/mute 后错误卡必须被静默',
     );
+
+    // 🔴 状态维护不被 muted 跳过（round-1 P2）：失败标记照常设置/清除，
+    // 蓄水池照常清 —— 静默的是通知，不是状态。
+    im.notify.handleTurnEnd(binding, { reason: { kind: 'error' }, message: { content: [] } });
+    assert.equal(im.lastTurnFailed.get(binding.sessionId), true, '失败 turn 后失败标记应设置（muted 同样生效）');
+    im.notify.appendStream(binding, '流式内容');
+    im.notify.handleTurnEnd(binding, { reason: { kind: 'completed' }, message: { content: [{ type: 'text', text: 'done' }] } });
+    assert.equal(im.lastTurnFailed.get(binding.sessionId), undefined, '成功 turn 后失败标记应清除（muted 同样生效）');
+    assert.equal(im.notify.state(binding.sessionId).reservoir, '', 'turn 结束蓄水池必须清空（muted 同样生效）');
+    assert.equal(mock.sent.length, 0, '以上 turn 全程未发任何消息（muted）');
   } finally {
     await teardown();
   }
@@ -1031,6 +1041,67 @@ test('回归：/retry 只在最近一次任务失败后可用（round-2 P2-6）'
     agent.followup = (m) => { followups.push(m); return orig(m); };
     await im.commandRetry({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' });
     assert.equal(followups.length, 1, '失败后 /retry 应重新提交任务');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：quiet hours 内失败 turn 仍设置标记、成功 turn 清除标记（round-1 P2）', async () => {
+  const script = [
+    { chunks: [ { type: 'text-delta', index: 0, text: 'ok' }, { type: 'finish', reason: { kind: 'stop' } } ] },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    await mock.sendFromUser({ text: '跑一个任务' });
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('任务完成')), { label: 'result card', timeoutMs: 8000 });
+    const binding = im.map.get('mock', 'chat-1');
+
+    // 进入静默时段（00:00-24:00 覆盖全天，测试不依赖真实时刻）
+    im.notify.quietHours = ['00:00-24:00'];
+    assert.ok(im.notify.inQuietHours(), '前置：此刻应在静默时段内');
+
+    // 🔴 静默时段内失败 turn 必须仍设置失败标记（旧版在 markTurnFailed 前就 return 了）
+    im.notify.handleTurnEnd(binding, { reason: { kind: 'error' }, message: { content: [] } });
+    assert.equal(im.lastTurnFailed.get(binding.sessionId), true, '静默时段内失败 turn 也应设置失败标记');
+
+    // 🔴 静默时段内成功 turn 必须清除标记（旧版不清 ⇒ 标记滞留 ⇒
+    // 静默期结束后 /retry 被误放行，可能重放带写操作的任务）
+    im.notify.handleTurnEnd(binding, { reason: { kind: 'completed' }, message: { content: [{ type: 'text', text: 'done' }] } });
+    assert.equal(im.lastTurnFailed.get(binding.sessionId), undefined, '静默时段内成功 turn 也必须清除失败标记（否则 /retry 被误放行）');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：/new 创建 agent 失败 → 回滚绑定，不留僵尸会话（round-1 P2）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    // 必须等首个 turn 结束（agent idle）——否则 /new 走"会话仍在运行"早退，测不到目标路径
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('任务完成')), { label: 'result card', timeoutMs: 8000 });
+    const firstSessionId = im.map.get('mock', 'chat-1').sessionId;
+
+    // 强制下一次 agent 创建失败（模拟 preset 挂载失败）
+    const origCreateAgent = im.createAgent.bind(im);
+    im.createAgent = async () => { throw new Error('boom: simulated agent init failure'); };
+    try {
+      await im.commandNew({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' });
+    } finally {
+      im.createAgent = origCreateAgent;
+    }
+
+    // 绑定必须被回滚：不留僵尸绑定（旧绑定已释放、新绑定已回滚）
+    assert.ok(!im.map.get('mock', 'chat-1'), '/new 失败时绑定必须回滚（不留僵尸会话）');
+    // 明确失败通知
+    assert.ok(mock.sent.some((m) => m.text?.includes('新会话创建失败')), '应明确通知创建失败');
+
+    // 状态一致：用户可再次 /new 成功
+    mock.reset();
+    await im.commandNew({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' });
+    const newBinding = im.map.get('mock', 'chat-1');
+    assert.ok(newBinding?.sessionId, '/new 失败后再次 /new 应成功');
+    assert.notEqual(newBinding.sessionId, firstSessionId, '新会话应是新的 id');
   } finally {
     await teardown();
   }

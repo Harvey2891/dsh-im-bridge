@@ -233,9 +233,9 @@ export class NotifyBus {
     }
     s.reservoir = '';
 
-    if (!this.onTurnEnd) return;
-    if (this.inQuietHours()) return;
-
+    // 🔴 状态维护**无条件**先于通知门（新计轮 round-1 P2）：「上一 turn 是否失败」是
+    // /retry 的上下文，不是通知。旧版在 quiet-hours / onTurnEnd=false 时早退，
+    // 不清除陈旧失败标记 ⇒ 静默期后 /retry 被误放行（可能重放带写操作的任务）。
     const reason = data.reason;
     const status = reason.kind === 'completed' ? 'completed'
       : reason.kind === 'error' ? 'error'
@@ -243,10 +243,12 @@ export class NotifyBus {
           : reason.kind === 'max-tokens' ? 'max-tokens'
             : reason.kind === 'blocked' ? 'blocked'
               : reason.kind === 'interrupted' ? 'interrupted' : 'completed';
-
     // 🔴 /retry 的失败上下文（round-2 P2-6）：只有**上一 turn 真的失败**才允许重试，
     // 否则用户在成功任务后发 /retry 会把（可能带写操作的）任务原样重跑一遍。
     if (this.markTurnFailed) this.markTurnFailed(binding.sessionId, status === 'error');
+
+    if (!this.onTurnEnd) return;
+    if (this.inQuietHours()) return;
 
     // 🔴 muted 门（round-2 P2-3）：静默聊天不推结果卡；蓄水池已在上面清掉，
     // 不会因跳过推送而堆积。审批仍走独立路径（见 /mute 回执文案）。

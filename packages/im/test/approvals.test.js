@@ -27,6 +27,22 @@ function makeManager({ timeoutSec = 0.1, pendingMaxSec = 0.3, autoApproveRisk = 
   return { mgr, map, sent, logs };
 }
 
+/**
+ * 可追踪的 AbortSignal 替身：Node 的 AbortSignal 无法枚举已注册监听，
+ * `signal.listeners` 不存在（旧测试因此 vacuously pass）。这里包装
+ * addEventListener/removeEventListener 来精确计数活跃监听。
+ */
+function makeTrackingSignal() {
+  const ac = new AbortController();
+  const active = new Set();
+  const signal = {
+    get aborted() { return ac.signal.aborted; },
+    addEventListener(type, fn) { ac.signal.addEventListener(type, fn); active.add(fn); },
+    removeEventListener(type, fn) { ac.signal.removeEventListener(type, fn); active.delete(fn); },
+  };
+  return { signal, activeCount: () => active.size, abort: () => ac.abort() };
+}
+
 const exec = (tool, args, agentId = 'im-mock-c1') => ({
   name: tool,
   arguments: args,
@@ -206,7 +222,7 @@ test('会话取消 → cancelled', async () => {
 // 修复：① 发送看门狗（sendTimeoutSec，默认 60s，测试里调小）先决者胜；
 //       ② 决议时移除 abort 监听（{once:true} 只在触发时移除，未触发会泄漏）。
 
-test('回归：发送永不 settle → 看门狗按 unavailable 兜底（P1-2）', async () => {
+test('回归：发送永不 settle → 看门狗按 unavailable 兜底，且调用方被解除（P1-2 + round-1 P1）', async () => {
   const sent = [];
   const logs = [];
   const { mgr } = makeManager({
@@ -225,10 +241,10 @@ test('回归：发送永不 settle → 看门狗按 unavailable 兜底（P1-2）
   });
   const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash' };
   const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
-  // 注意：此处**不** await p —— p 会卡在挂死的 await send 上（挂死的是渠道，
-  // 不是审批）。看门狗触发后审批状态机立即解锁：record 删除、日志落
-  // unavailable、后续 respond 报 ignored。断言这些状态事实而不是等 p。
-  await new Promise((r) => setTimeout(r, 500));
+  // 🔴 round-1 P1 核心断言：**await p 必须在有限时间内 resolve**。
+  // 旧版 prompt() 直接 await send，发送挂死时 p 永不 settle（审批链/agent turn 卡死）；
+  // 现在 send 是 fire-and-forget，看门狗结算后调用方立即拿到 unavailable。
+  assert.equal(await p, 'unavailable', '发送挂死不得阻塞调用方：看门狗结算后 p 必须 resolve unavailable');
   assert.ok(sent.some((m) => m.text?.includes('推送超时')), '应补发推送超时提醒');
   // 记录已决，不留 waiting 残留
   assert.equal(mgr.records.size, 0, '看门狗结算后记录必须删除');
@@ -267,14 +283,28 @@ test('回归：发送期间 abort → 记录立即 cancelled（P1-2 时序）', 
 
 test('回归：abort 监听在决议时移除（不泄漏，P1-2 连带）', async () => {
   const { mgr } = makeManager({ timeoutSec: 60 });
-  const ac = new AbortController();
-  const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash', signal: ac.signal };
+  const { signal, activeCount } = makeTrackingSignal();
+  const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash', signal };
   const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
   await new Promise((r) => setTimeout(r, 10));
+  assert.equal(activeCount(), 1, '等待期间 abort 监听应已注册');
   const id = mgr.pendingList()[0].id;
   mgr.respond(id, 'no', { platform: 'mock', userId: 'u1' });
   assert.equal(await p, 'rejected');
   // 决议（非 abort 触发）后监听必须已移除：计数归零
-  const listeners = ac.signal.listeners?.('abort') ?? [];
-  assert.equal(listeners.length, 0, '决议后 abort 监听必须移除（{once:true} 只在触发时移除，会泄漏）');
+  assert.equal(activeCount(), 0, '决议后 abort 监听必须移除（{once:true} 只在触发时移除，会泄漏）');
+});
+
+test('回归：dispose 也移除 abort 监听（不泄漏，round-1 P2）', async () => {
+  const { mgr } = makeManager({ timeoutSec: 60 });
+  const { signal, activeCount } = makeTrackingSignal();
+  const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash', signal };
+  const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(activeCount(), 1, '等待期间监听应已注册');
+  // 有 pending 审批时卸载 manager：旧版先置空 onAbort 再 resolve，
+  // resolve 内的 removeEventListener 被跳过 ⇒ 监听泄漏在 AbortSignal 上。
+  mgr.dispose();
+  assert.equal(activeCount(), 0, 'dispose 必须显式移除 abort 监听（会话级 signal 比单个审批长寿）');
+  assert.equal(await p, 'cancelled', 'dispose 后 outcome 必须按 cancelled 结算');
 });

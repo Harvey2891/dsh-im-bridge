@@ -997,7 +997,19 @@ export class ImRuntime extends Service {
       binding.mutedBy = inheritedMuted;
       await this.map.save();
     }
-    await this.createAgent(binding.sessionId);
+    try {
+      await this.createAgent(binding.sessionId);
+    } catch (err) {
+      // 🔴 agent 创建失败 → 回滚绑定（新计轮 round-1 P2）：否则留下"僵尸会话"——
+      // 绑定已落盘但 agent 不存在，后续消息走已绑定路径拿不到 agent 而卡死，
+      // /new 也看到旧绑定。map.remove 自带 _scheduleSave 持久化。
+      this.log.error(`im: /new agent 创建失败，已回滚绑定 | sessionId=${binding.sessionId} err=${err.message}`);
+      this.map.remove(platform, chatId);
+      await this.send({ platform, chatId }, {
+        text: `❌ 新会话创建失败（agent 初始化失败）。请再发一次 /new 重试。`,
+      });
+      return;
+    }
     await this.send({ platform, chatId }, {
       text: `✅ 新会话已创建（${binding.sessionId}）。\n直接发送任务即可，例如：\n> 跑一下 tests 目录的 pytest`,
     });

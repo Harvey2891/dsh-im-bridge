@@ -77,7 +77,13 @@ export class ApprovalManager {
       clearTimeout(rec.timeoutTimer);
       clearTimeout(rec.pendingTimer);
       clearTimeout(rec.sendTimeoutTimer);
-      if (rec.onAbort) rec.onAbort = null; // record 即将丢弃；AbortSignal 随请求结束
+      if (rec.onAbort) {
+        // 🔴 必须**先移除监听再置空**（新计轮 round-1 P2）：旧版先置空再 resolve，
+        // resolve 内的 removeEventListener 被跳过 ⇒ 监听泄漏在 AbortSignal 上
+        // （会话级 signal 比单个审批请求长寿，重复挂载/卸载会累积）。
+        rec.req?.signal?.removeEventListener('abort', rec.onAbort);
+        rec.onAbort = null;
+      }
       rec.resolve('cancelled');
     }
     this.records.clear();
@@ -150,7 +156,6 @@ export class ApprovalManager {
         clearTimeout(record.timeoutTimer);
         clearTimeout(record.pendingTimer);
         clearTimeout(record.sendTimeoutTimer);
-        record.lastOutcome = value;
         if (record.onAbort && req.signal) req.signal.removeEventListener('abort', record.onAbort);
         record.onAbort = null;
         this.logLine({
@@ -173,11 +178,10 @@ export class ApprovalManager {
         resolve(value);
       };
     });
-    record.decided = record.resolve;
     this.records.set(approvalId, record);
 
-    // 🔴 abort 监听必须**先于** send 注册：send 是 await 的，若注册在它之后，
-    // 发送期间发生的会话取消就无人处理 —— 记录停在 waiting、旧卡片仍可点
+    // 🔴 abort 监听必须**先于** send 启动注册：send 是异步 fire-and-forget 的，
+    // 若注册在它之后，发送期间发生的会话取消就无人处理 —— 记录停在 waiting、旧卡片仍可点
     // （round-n1 F11）。这里还额外处理"注册时已经 aborted"的情形。
     if (req.signal?.aborted) {
       record.resolve('cancelled');
@@ -190,11 +194,13 @@ export class ApprovalManager {
       req.signal.addEventListener('abort', record.onAbort);
     }
 
-    // 🔴 推送看门狗（round-2 P1-2）：必须**先于** await send 武装——send 永不 settle
+    // 🔴 推送看门狗（round-2 P1-2）：必须在 send **启动前**武装——send 永不 settle
     // （webhook 挂死）时，若武装在 send 之后则永远执行不到，审批状态机照样挂死。
-    // 只覆盖**发送阶段**（sendTimeoutSec 默认 60s）：发送 settle 即清除；
+    // 只覆盖**发送阶段**（sendTimeoutSec 默认 60s）：发送 settle 或已决即清除；
     // 之后的用户等待窗口由 timeoutSec/pendingMaxSec 管理，看门狗不参与。
     // 与 abort/用户决议共用 record.resolve 的已决守卫，先决者胜。
+    // 🔴 看门狗结算后调用方**立即**拿到 outcome（round-1 P1）：prompt() 不再 await
+    // send（见下方 fire-and-forget），挂死的只是渠道的 send promise，不是审批。
     const cardText = `⏳ 审批 #${approvalId} 卡片推送超时，已按拒绝处理（可重新触发任务）。`;
     record.sendTimeoutTimer = setTimeout(() => {
       if (record.state !== 'waiting') return;
@@ -204,31 +210,41 @@ export class ApprovalManager {
     }, this.sendTimeoutSec * 1000);
 
     const card = this.renderCard(record);
-    try {
-      await this.send({ platform: binding.platform, chatId: binding.chatId }, card);
-      clearTimeout(record.sendTimeoutTimer); // 发送成功：看门狗使命完成（round-2 P1-2）
-    } catch (err) {
-      // 推送失败：不阻塞 agent——按 unavailable 处理（fail closed）
-      record.resolve('unavailable');
-      return 'unavailable';
-    }
-
-    // 超时 → pending（可恢复拒绝，FR-6.4）
-    record.timeoutTimer = setTimeout(() => {
-      if (record.state !== 'waiting') return;
-      record.state = 'pending';
-      void this.send({ platform: binding.platform, chatId: binding.chatId }, {
-        text: `⏳ 审批 #${approvalId} 等待中：任务被阻塞，等待你的审批。\n回复 /approve ${approvalId} yes 或 no；或直接点卡片按钮。`,
-      }).catch(() => {});
-      // 再超 → 失败关闭（deny-by-default 兜底）
-      record.pendingTimer = setTimeout(() => {
-        if (record.state !== 'pending') return;
-        record.resolve('rejected');
-        void this.send({ platform: binding.platform, chatId: binding.chatId }, {
-          text: `❌ 审批 #${approvalId} 超时未响应，已拒绝（可重试）。`,
-        }).catch(() => {});
-      }, this.pendingMaxSec * 1000);
-    }, this.timeoutSec * 1000);
+    // 🔴 发送与返回**解耦**（新计轮 round-1 P1）：旧版直接 await send，渠道发送挂死
+    // （webhook 永不 settle）时 prompt() 永不 return，审批应答者/DSH 工具审批链
+    // 永久 pending —— agent turn 不结束、无结果卡、用户任务卡死。看门狗当时只解了
+    // record（状态机），没解调用方。现在 send 是 fire-and-forget：
+    //   成功 → 清看门狗、武装用户等待窗口（语义不变）；
+    //   失败 → fail-closed unavailable（语义不变）；
+    //   挂死 → 看门狗按 unavailable 结算，调用方**立即**拿到 outcome。
+    // 返回值始终是 outcome（由看门狗/abort/用户/pending 超时结算），
+    // 调用方永不被渠道发送阻塞。
+    void this.send({ platform: binding.platform, chatId: binding.chatId }, card).then(
+      () => {
+        clearTimeout(record.sendTimeoutTimer); // 发送成功：看门狗使命完成
+        if (record.state !== 'waiting') return; // 发送期间已决（abort/用户）：不武装等待窗口
+        // 超时 → pending（可恢复拒绝，FR-6.4）
+        record.timeoutTimer = setTimeout(() => {
+          if (record.state !== 'waiting') return;
+          record.state = 'pending';
+          void this.send({ platform: binding.platform, chatId: binding.chatId }, {
+            text: `⏳ 审批 #${approvalId} 等待中：任务被阻塞，等待你的审批。\n回复 /approve ${approvalId} yes 或 no；或直接点卡片按钮。`,
+          }).catch(() => {});
+          // 再超 → 失败关闭（deny-by-default 兜底）
+          record.pendingTimer = setTimeout(() => {
+            if (record.state !== 'pending') return;
+            record.resolve('rejected');
+            void this.send({ platform: binding.platform, chatId: binding.chatId }, {
+              text: `❌ 审批 #${approvalId} 超时未响应，已拒绝（可重试）。`,
+            }).catch(() => {});
+          }, this.pendingMaxSec * 1000);
+        }, this.timeoutSec * 1000);
+      },
+      () => {
+        // 推送失败：不阻塞 agent——按 unavailable 处理（fail closed）
+        record.resolve('unavailable');
+      },
+    ).catch(() => {});
 
     return outcome;
   }
