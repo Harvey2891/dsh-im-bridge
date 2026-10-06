@@ -1107,6 +1107,34 @@ test('回归：/new 创建 agent 失败 → 回滚绑定，不留僵尸会话（
   }
 });
 
+test('回归：autoCreate 首条消息 agent 创建失败 → 回滚绑定 + 回执（round-2 P2）', async () => {
+  // MOCK_CFG.autoCreate=true：新聊天首条授权消息自动建会话（/new 的 P2-4 同类路径）
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    const origCreateAgent = im.createAgent.bind(im);
+    im.createAgent = async () => { throw new Error('boom: simulated agent init failure'); };
+    try {
+      await mock.sendFromUser({ text: '跑一个任务' });
+    } finally {
+      im.createAgent = origCreateAgent;
+    }
+
+    // 🔴 僵尸绑定必须回滚（旧版：binding 已落盘、异常裸抛、任务静默丢失、
+    // 且僵尸占用 maxSessions 额度）
+    assert.ok(!im.map.get('mock', 'chat-1'), 'autoCreate 首条消息失败后绑定必须回滚（不留僵尸会话）');
+    // 明确失败回执（任务未执行）
+    assert.ok(mock.sent.some((m) => m.text?.includes('会话创建失败')), '应告知用户任务未执行');
+
+    // 状态一致：用户重发同一条消息即可成功
+    mock.reset();
+    await mock.sendFromUser({ text: '再跑一次' });
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('任务完成')), { label: 'retry result card', timeoutMs: 8000 });
+    assert.ok(im.map.get('mock', 'chat-1')?.sessionId, '重试成功后会话应建立');
+  } finally {
+    await teardown();
+  }
+});
+
 test('回归：/log 宣布段数 = 实际段数，无二次切分（round-2 P2-5）', async () => {
   const { mock, im, teardown } = await setup(QSCRIPT);
   try {

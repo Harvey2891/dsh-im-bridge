@@ -285,13 +285,15 @@ export class UserQuestionAnswerer {
           : '文字题：**直接回复文字**即可（本卡片全部是文字题）。')
         : '',
       `不想选：回 \`skip\`（或 \`/answer ${record.id} skip\`），agent 会自行决定后继续。`,
-      record.questions.length > 1
-        ? `按钮可逐题点选：答全会自动提交；也可发 \`/answer ${record.id} done\` 提前提交（未答的题按跳过）。`
-        : record.questions.some((q) => q.multiSelect)
-          // 🔴 单题多选卡同样必须提示 done（新计轮 round-1 P2）：统一结题门下多选卡
-          // 永不自动提交，卡片不写清"要发 done"，用户按"直接回数字"操作后会撞进
-          // incomplete 状态，表现为"按钮没反应"。
-          ? `本卡含**多选题**：**不会自动提交**——选完请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔，如 \`1,3\`）。`
+      // 🔴 多选判定必须**优先于**多题分支（新计轮 round-2 P2-1）：多题卡里只要有一题
+      // multiSelect，统一结题门（_mayAutoSettle）就禁止自动提交——旧版多题分支无条件
+      // 写"答全会自动提交"，对含多选的卡是错误承诺：用户答完会停在 partial（操作无效）。
+      record.questions.some((q) => q.multiSelect)
+        ? (record.questions.length > 1
+          ? `本卡含**多选题**：按钮可逐题点选，但选完**不会自动提交**——请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔，如 \`1,3\`）。`
+          : `本卡含**多选题**：**不会自动提交**——选完请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔，如 \`1,3\`）。`)
+        : record.questions.length > 1
+          ? `按钮可逐题点选：答全会自动提交；也可发 \`/answer ${record.id} done\` 提前提交（未答的题按跳过）。`
           : '',
     );
 

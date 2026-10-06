@@ -415,6 +415,47 @@ test('回归：single-select 多选被拒；multiSelect 允许多选', async () 
   await p;
 });
 
+test('回归：多题卡含多选不得承诺"答全自动提交"（round-2 P2-1）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?（多选）', options: [{ label: 'b1' }, { label: 'b2' }], multiSelect: true },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+  // 🔴 多题卡里只要有一题 multiSelect，统一结题门就禁止自动提交——
+  // 旧版多题分支无条件写"答全会自动提交"，是错误承诺（用户答完停在 partial）。
+  assert.ok(!card.text.includes('答全会自动提交'), '含多选的多题卡不得承诺"答全会自动提交"');
+  assert.ok(card.text.includes('不会自动提交'), '应明确"不会自动提交"');
+  assert.ok(card.text.includes('/answer'), '应给出 done 提交命令');
+});
+
+test('回归：无多选的多题卡保留"答全自动提交"口径（round-2 P2-1 负向对照）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+  assert.ok(card.text.includes('答全会自动提交'), '无多选的多题卡应保留"答全会自动提交"');
+  assert.ok(!card.text.includes('不会自动提交'), '无多选的卡不得出现多选警示');
+});
+
 test('回归：timed 超时后迟答经 DSH 继续协议转交（continued）', async () => {
   const delivered = [];
   const svc = {

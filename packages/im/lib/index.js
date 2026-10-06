@@ -680,6 +680,10 @@ export class ImRuntime extends Service {
     const { platform, chatId, userId, userName, text } = msg;
     const cfg = this.cfg.security;
     let binding = this.map.get(platform, chatId);
+    // 🔴 本条消息是否**新建**了绑定（新计轮 round-2 P2-2）：agent 创建失败时只有
+    // "本次新建"的绑定才回滚（不留僵尸会话）；既有会话失败必须**保留**绑定——
+    // 下次消息还能重试恢复/创建，只发失败回执。
+    const createdHere = !binding;
 
     // 新聊天默认不自动建 session（FR-2.3）
     if (!binding) {
@@ -725,13 +729,29 @@ export class ImRuntime extends Service {
       }
     }
 
-    let agent = this.ctx.agents.get(binding.sessionId);
-    if (!agent) {
-      // DSH 重启后：优先恢复原会话（FR-2.2 / UC6），失败才新建
-      agent = await this.tryResume(binding.sessionId);
+    let agent;
+    try {
+      agent = this.ctx.agents.get(binding.sessionId);
       if (!agent) {
-        agent = await this.createAgent(binding.sessionId);
+        // DSH 重启后：优先恢复原会话（FR-2.2 / UC6），失败才新建
+        agent = await this.tryResume(binding.sessionId);
+        if (!agent) {
+          agent = await this.createAgent(binding.sessionId);
+        }
       }
+    } catch (err) {
+      // 🔴 agent 创建/恢复失败（preset 挂载失败等）不得裸抛进 dispatchInbound——
+      // 否则首条任务静默丢失、用户无任何回执；绑定也不得留着当僵尸（新计轮
+      // round-2 P2-2：autoCreate 首条消息的 /new-P2-4 同类路径）。
+      // 只回滚"本次新建"的绑定；既有会话保留绑定（下次消息可重试恢复/创建）。
+      this.log.error('im: 会话 agent 创建/恢复失败 | session=%s | %s', binding.sessionId, err?.message ?? err);
+      if (createdHere) this.map.remove(platform, chatId);
+      await this.send({ platform, chatId }, {
+        text: createdHere
+          ? '❌ 会话创建失败（agent 初始化失败），任务未执行。请再发一次本条消息重试。'
+          : '❌ 会话暂不可用（agent 初始化失败），任务未执行。请再发一次本条消息重试，或发 /new 重建会话。',
+      }).catch(() => {});
+      return;
     }
 
     this.lastUserTexts.set(binding.sessionId, text);
