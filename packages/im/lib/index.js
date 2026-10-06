@@ -22,9 +22,10 @@ import { chatKey, userKey, parseUserKey, sessionIdFor } from './message.js';
 import { validateAdapterContract } from './channel.js';
 import { SessionMap } from './session-map.js';
 import { registerCommand, parseCommand, helpText, commands } from './commands.js';
-import { markdownToText, splitLongText, summarizeLongOutput } from './renderer.js';
+import { markdownToText, splitLongText, summarizeLongOutput, splitByBytes } from './renderer.js';
 import { ApprovalManager } from './approvals.js';
 import { NotifyBus } from './notify.js';
+import { UserQuestionAnswerer } from './user-questions.js';
 import { defaultRiskRules } from './risk.js';
 
 const name = 'im';
@@ -75,10 +76,31 @@ const Config = z.object({
     preset: z.string().default('standard'),
   }),
   storeDir: z.string().default(''),                    // 空 → $DSH_HOME/dsh-im
+  userQuestions: z.object({
+    // 把 agent 的 ask_user_question 转成 IM 消息并等待应答。
+    // 关闭时该请求交给其他应答者（GUI 等）；IM 场景下关闭 = agent 提问会失败。
+    enabled: z.boolean().default(true),
+    // 0 = 无限等待（对齐 ask_user_question 默认「等待用户」语义）
+    timeoutSec: z.number().default(0),
+  }),
 });
 
 /** 默认模型兜底（与官方 base agent-default-model 一致）。 */
 const DEFAULT_MODEL = { provider: 'deepseek-official', model: 'deepseek-v4-flash' };
+
+/**
+ * 把中性按钮降级为正文命令文本（供**文本型渠道**预算用）。
+ *
+ * 适配器侧的 `buttonsAsCommands` 会按 `text.includes(command)` 去重，所以核心只要
+ * 保证这段文本里**出现 command 原文**，适配器就不会重复追加。
+ * 返回空串表示该消息没有可降级的按钮。
+ */
+function buttonsAsText(buttons) {
+  if (!Array.isArray(buttons) || buttons.length === 0) return '';
+  return buttons
+    .map((b) => `• ${b.label ?? ''} → ${b.command ?? b.id}`)
+    .join('\n');
+}
 
 export class ImRuntime extends Service {
   static inject = inject;
@@ -139,6 +161,17 @@ export class ImRuntime extends Service {
     });
     this.approvals.mount();
 
+    // 用户提问应答者：把 ask_user_question 转成 IM 消息并等待回答。
+    // 没有它，IM 会话里 agent 提问会落到 noAnswerer 并抛 NO_PROVIDER。
+    this.userQuestions = new UserQuestionAnswerer({
+      ctx: this.ctx,
+      map: this.map,
+      send: (chat, out) => this.send(chat, out),
+      logLine: (line) => this.appendLog('questions', line),
+      cfg: cfg.userQuestions,
+    });
+    this.userQuestions.mount();
+
     // 通知
     this.notify = new NotifyBus({
       ctx: this.ctx,
@@ -175,6 +208,7 @@ export class ImRuntime extends Service {
 
     this._dispose.push(() => {
       this.approvals.dispose();
+      this.userQuestions?.dispose();
       this.notify.dispose();
       void this.map.dispose();
     });
@@ -202,12 +236,129 @@ export class ImRuntime extends Service {
     return this.channels.get(platform) ?? null;
   }
 
-  /** 出站路由：统一模型 → 渠道 send()。 */
+  /**
+   * 出站路由：统一模型 → 渠道 send()。
+   *
+   * 附带把该会话已知的 `userId` 一并下传：有些平台（钉钉）的**主动推送**必须用
+   * 平台 userId，而 `chatId` 是会话级不透明串（conversationId），拿它当 userId 会被
+   * 平台拒绝（staffId.notExisted）。会话绑定是**持久化**的（SessionMap），所以由核心
+   * 在这里补齐，而不是让适配器自己维护易失的内存映射——后者重启即丢，导致出站静默失败。
+   */
   async send({ platform, chatId }, out) {
     await this._ready;
     const channel = this.channels.get(platform);
     if (!channel) throw new Error(`im: no channel registered for "${platform}"`);
-    return channel.send({ ...out, platform, chatId });
+    // 取该会话最近活跃的用户 id（私聊即对话对象；群聊取最近发言者）。
+    // 注意：binding.users 是 Map<userId, {name,lastActiveAt}> —— userId 是**键**，
+    // 不在值对象里，所以必须读 keys()，读 values() 会拿到 undefined。
+    const binding = this.map.get(platform, chatId);
+    // 取该会话**最近活跃**的用户 id。
+    // 注意 1：binding.users 是 Map<userId, {name,lastActiveAt}> —— userId 是**键**，
+    //         不在值对象里，必须读 keys()（读 values() 会拿到 undefined）。
+    // 注意 2：Map 对**已有键**重新 set **不会**改变迭代顺序，所以 `at(-1)` 拿到的是
+    //         「最早加入」而非「最近活跃」。群聊 A→B→A 时键序仍是 [A,B]，会回推给 B。
+    //         因此按 lastActiveAt 显式取最近者。
+    let userId;
+    if (binding?.users?.size) {
+      let newest;
+      let newestAt = -1;
+      for (const [id, info] of binding.users) {
+        const at = info?.lastActiveAt ?? 0;
+        if (at >= newestAt) { newestAt = at; newest = id; }
+      }
+      userId = newest;
+    }
+    const body = { ...out, platform, chatId, ...(userId ? { userId } : {}) };
+
+    // 🔴 出站文本必须**只有一处**生成（单一真源），否则预算与实发不符。
+    //
+    // 文本型渠道（声明 `buttonsAsText`，如钉钉）渲染不了内联按钮，只能把按钮降级成
+    // 正文命令。此前核心只在预算里"估算"这段文本、却仍把 buttons 交给适配器去追加：
+    // 适配器用**子串**判断是否已存在，命令跨段或作为子串出现时会重复追加或漏加，
+    // 最终实发正文超限被平台截断（round-2 发现 1、7）。
+    // 现在由核心**直接拼好最终文本并清掉 buttons**，适配器原样发送即可 ——
+    // 预算与实发字节数因此逐字节一致，也不再需要任何子串去重。
+    //
+    // 但命令块必须**不可拆分**：若与正文一起切分，一条命令会被切成两半，用户无法
+    // 复制（round-3 发现）。因此正文与命令块**分开切分**，命令块整体放在最后一段；
+    // 放不下就单独作为一条消息发出。
+    const degradesButtons = channel.buttonsAsText === true;
+    const commands = (degradesButtons && body.buttons?.length) ? buttonsAsText(body.buttons) : '';
+    if (commands) body.buttons = undefined;   // 已渲染进正文；避免适配器二次追加
+
+    const maxBytes = channel.maxMessageBytes;
+    const mainText = body.text ?? '';
+    if (!maxBytes) {
+      if (commands) body.text = mainText ? `${mainText}\n\n${commands}` : commands;
+      return this._dispatch(channel, body);
+    }
+
+    const full = commands ? (mainText ? `${mainText}\n\n${commands}` : commands) : mainText;
+    if (!full) return this._dispatch(channel, body);
+    if (Buffer.byteLength(full, 'utf8') <= maxBytes) {
+      if (commands) body.text = full;
+      return this._dispatch(channel, body);
+    }
+
+    // 前缀 `(i/n) ` 的字节数是 `digits(i)+digits(n)+4`，随段数增长：
+    // 固定 12 字节在 5 位段数（>9999 段）时不敷。这里按实际段数迭代求出预留量。
+    // 只切分**正文**；命令块独立处理，保证不被切开。
+    let reserve = 8;
+    let parts = splitByBytes(mainText || full, Math.max(1, maxBytes - reserve));
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const need = String(parts.length + 1).length * 2 + 4;
+      if (need <= reserve) break;
+      reserve = need;
+      parts = splitByBytes(mainText || full, Math.max(1, maxBytes - reserve));
+    }
+
+    // 命令块整体作为**独立末段**：正文末段通常已接近预算上限，把命令并进去
+    // 会重新超限（实测 300 上限得到 356 字节），所以只要发生分段就让命令独占一段。
+    const cmdOwnSegment = !!commands;
+    const total = parts.length + (cmdOwnSegment ? 1 : 0);
+
+    let last;
+    for (let i = 0; i < parts.length; i++) {
+      const isLastBody = i === parts.length - 1;
+      last = await this._dispatch(channel, {
+        ...body,
+        text: `(${i + 1}/${total}) ${parts[i]}`,
+        // 附件只在最后一段附带（每段都带会被重复投递）
+        ...(isLastBody && !cmdOwnSegment ? {} : { attachments: undefined }),
+      });
+    }
+    if (cmdOwnSegment) {
+      const cmdParts = splitByBytes(commands, Math.max(1, maxBytes - reserve));
+      for (let j = 0; j < cmdParts.length; j++) {
+        const idx = parts.length + j + 1;
+        last = await this._dispatch(channel, {
+          ...body,
+          text: `(${idx}/${total}) ${cmdParts[j]}`,
+          attachments: undefined,
+        });
+      }
+    }
+    return last;
+    return last;
+  }
+
+  /**
+   * 真正调用渠道 `send()`，并把「发送失败」统一转成异常。
+   *
+   * 适配器可能在**不抛异常**的情况下失败（如钉钉无 sessionWebhook 且无 userId 时
+   * 返回 `{failed:true}`）。若不在此转成异常，调用方（提问/审批应答者）会以为
+   * 送达成功，记录一直停在 waiting —— 用户什么也没收到，agent 永远等不到答案。
+   */
+  async _dispatch(channel, body) {
+    const result = await channel.send(body);
+    if (result && result.failed) {
+      const err = new Error(
+        `im: channel "${channel.platform}" failed to deliver: ${result.reason ?? 'unknown'}`,
+      );
+      err.code = result.reason;
+      throw err;
+    }
+    return result;
   }
 
   /** 出站路由（显式目标，含按钮/附件），供其他插件复用。 */
@@ -234,6 +385,14 @@ export class ImRuntime extends Service {
     }
     if (!this.map.dedupe(platform, msg.msgId)) return; // FR-1.4 幂等去重
 
+    // 先记录发言者：出站要带平台 userId（钉钉主动推送必须用它），而 send() 从
+    // 会话映射读取。必须早于任何回复，否则首条消息（如首接触提示）会缺 userId。
+    // touch 只在已有绑定时生效；首条消息可能尚未建绑定，故缺失时先建绑定。
+    if (!this.map.get(platform, chatId)) {
+      this.map.create(platform, chatId, { chatType: msg.chatType ?? 'private' });
+    }
+    this.map.touch(platform, chatId, userId, msg.userName);
+
     // FR-8.2：allowlist 之外的用户「可读不可写」→ 派活/命令一律拒绝（admins 隐式放行）
     if (!this.isAllowed(platform, userId)) {
       await this.trustGate(msg);
@@ -245,6 +404,37 @@ export class ImRuntime extends Service {
     if (parsed && commands.has(parsed.name)) {
       await this.handleCommand(msg, parsed);
       return;
+    }
+
+    // 待答提问优先：直接回「数字」或「skip」即视为作答，不必记 `/answer <id> <编号>` 语法。
+    // 这同时填掉一个坑：提问等待期间再发普通消息会让当前回合被中断（turn/end aborted by
+    // user），而中断时提问只能以**空答案**收场。先在此处消费掉答案，就不会误触发中断。
+    const pendingQ = this.userQuestions?.pendingFor(platform, chatId);
+    if (pendingQ && text) {
+      const t = text.trim();
+      const isSkip = /^(skip|跳过)$/i.test(t);
+      const isChoice = /^\d+(\.\d+)?([,，\s]+\d+(\.\d+)?)*$/.test(t);
+      if (isSkip || isChoice) {
+        await this.commandAnswer(msg, [pendingQ.id, t]);
+        return;
+      }
+      // 无预设选项的问题：卡片提示「请直接回复文字」，就得把这条文本当答案收下，
+      // 否则提示与实际行为矛盾（文字进了派活，提问一直挂着）。
+      const noOptions = pendingQ.questions.every((q) => !(q.options ?? []).length);
+      if (noOptions && !parseCommand(t)) {
+        const result = this.userQuestions.respond(String(pendingQ.id), [], t, {
+          platform, chatId,
+        });
+        const texts = {
+          answered: `✅ 已回答提问 #${pendingQ.id}，agent 继续。`,
+          'not-found': `ℹ️ 提问 #${pendingQ.id} 不存在、已回答或已超时。`,
+          forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+          continued: `✅ 已回答提问 #${pendingQ.id}（此前已超时挂起，答案已转交 agent）。`,
+          'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案。',
+        };
+        await this.send({ platform, chatId }, { text: texts[result] ?? `ℹ️ ${result}` });
+        return;
+      }
     }
 
     // 普通消息 → 派活
@@ -278,6 +468,36 @@ export class ImRuntime extends Service {
           forbidden: `⛔ 无权限。`,
         };
         return reply(texts[result] ?? `ℹ️ ${result}`);
+      }
+      case 'q': {
+        // 用户提问的选项按钮：q:<questionId>:<qIndex>:<oIndex>
+        if (!this.isAllowed(platform, userId)) {
+          return reply(`⛔ 无权限：回答提问需要 allowlist 成员身份（当前 ${platform}:${userId} 未授权）。`);
+        }
+        if (!this.userQuestions) return reply('ℹ️ 提问应答未启用。');
+        const [, qid, qIdxRaw, oIdxRaw] = parts;
+        // 按钮应答**累计**进草稿：答全自动提交；未答全保持等待并回报进度。
+        // （此前一次点击即结题，多问题卡片其余题会被当成空答案，余下按钮失效。）
+        const acc = this.userQuestions.accumulate(
+          qid,
+          [{ qIndex: Number(qIdxRaw), oIndex: Number(oIdxRaw) }],
+          { platform, chatId },   // 归属校验：只有提问所在会话能作答
+        );
+        const qTexts = {
+          answered: `✅ 已回答提问 #${qid}，agent 继续。`,
+          'not-found': `ℹ️ 提问 #${qid} 不存在、已回答或已超时。`,
+          invalid: `⚠️ 选项无效，提问仍在等待——请按卡片编号重发。`,
+          forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+        };
+        if (acc.status === 'partial') {
+          const hint = acc.needsText
+            ? `\n该卡片含**自由文本题**，按钮无法作答——请直接回复文字，或发 \`/answer ${qid} done\` 提交当前选择。`
+            : `\n进度 ${acc.answered}/${acc.total}——继续点其余题，或发 \`/answer ${qid} done\` 直接提交。`;
+          return reply(
+            `📝 已记录提问 #${qid} 的第 ${(Number(qIdxRaw) || 0) + 1} 题：${acc.label ?? ''}${hint}`,
+          );
+        }
+        return reply(qTexts[acc.status] ?? `ℹ️ ${acc.status}`);
       }
       case 'trust': {
         const [, targetPlatform, ...rest] = parts;
@@ -588,6 +808,13 @@ export class ImRuntime extends Service {
       descEn: 'approve/reject by text',
       run: (c, args) => c.core.commandApprove(c.msg, args),
     });
+    registerCommand('answer', {
+      perm: 'user',
+      usage: '<id> <编号>[,<编号>] | skip',
+      desc: '回答 agent 的提问（无按钮渠道降级路径）；skip 跳过让 agent 自行决定',
+      descEn: 'answer an agent question by option number, or skip',
+      run: (c, args) => c.core.commandAnswer(c.msg, args),
+    });
     registerCommand('trust', {
       perm: 'admin',
       usage: '<platform:userId>',
@@ -699,7 +926,13 @@ export class ImRuntime extends Service {
     }
     const channel = this.channels.get(msg.platform);
     if (channel && typeof channel.sendFile === 'function') {
-      await channel.sendFile(binding.chatId, `im-${binding.sessionId}.md`, full, 'text/markdown');
+      const r = await channel.sendFile(binding.chatId, `im-${binding.sessionId}.md`, full, 'text/markdown');
+      // 适配器可能在没有投递路径时返回 {failed:true} —— 不能就此当作已交付
+      if (r && r.failed) {
+        await this.send({ platform: msg.platform, chatId: msg.chatId }, {
+          text: `⚠️ 无法投递全文（${r.reason ?? '未知原因'}）。请在聊天里发一条消息刷新会话后再试。`,
+        });
+      }
       return;
     }
     // 无 sendFile 的渠道：长文本分段发送
@@ -744,6 +977,95 @@ export class ImRuntime extends Service {
       forbidden: `⛔ 无权限：审批需要 allowlist 成员身份。`,
     };
     await this.send({ platform: msg.platform, chatId: msg.chatId }, { text: texts[result] ?? `ℹ️ ${result}` });
+  }
+
+  /**
+   * `/answer <id> <编号>[,<编号>] [自定义文字]`
+   * 按钮不可用时的降级路径。多问题时编号形如 `1.2`（问题序号.选项序号）；
+   * 单问题时直接写选项序号。
+   *
+   * `/answer <id> skip`（或 `0`）→ 跳过选择，让 agent 自行决定后继续。
+   */
+  async commandAnswer(msg, args) {
+    const chat = { platform: msg.platform, chatId: msg.chatId };
+    const [id, picksRaw, ...customParts] = args;
+    if (!id || !picksRaw) {
+      return this.send(chat, {
+        text: '用法：/answer <id> <编号>[,<编号>] [自定义文字]\n'
+          + '      /answer <id> skip        跳过选择，让 agent 自行决定\n'
+          + '例：/answer 01 2   或   /answer 01 1.1,1.3   （编号见提问卡片）',
+      });
+    }
+    if (!this.userQuestions) {
+      return this.send(chat, { text: 'ℹ️ 提问应答未启用。' });
+    }
+
+    // findRecord 同时覆盖「等待中」与「已挂起可续答（timed 超时后）」两种记录
+    const rec = this.userQuestions.findRecord(String(id));
+    if (!rec) {
+      return this.send(chat, { text: `ℹ️ 提问 #${id} 不存在、已回答或已超时。` });
+    }
+    const isContinued = !this.userQuestions.records.has(String(id));
+
+    // 提交草稿：/answer <id> done —— 未答的题按跳过处理（配合按钮逐题累计）
+    if (/^(done|提交|ok)$/i.test(String(picksRaw).trim())) {
+      const r = this.userQuestions.commitDraft(String(id), { platform: msg.platform, chatId: msg.chatId });
+      const t = {
+        answered: `✅ 已提交提问 #${id} 的当前选择，agent 继续。`,
+        empty: `ℹ️ 提问 #${id} 还没有任何选择——请先按编号或点按钮选择。`,
+        'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
+        forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+      };
+      return this.send(chat, { text: t[r] ?? `ℹ️ ${r}` });
+    }
+
+    // 跳过：不选任何选项，返回空答案，agent 自行决定
+    if (/^(skip|跳过|0)$/i.test(String(picksRaw).trim())) {
+      const r = this.userQuestions.skip(String(id), { platform: msg.platform, chatId: msg.chatId });
+      const t = {
+        skipped: `⏭️ 已跳过提问 #${id}，agent 将自行决定后继续。`,
+        'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
+        forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+        continued: `⏭️ 已跳过提问 #${id}（此前已超时挂起，答案已转交 agent）。`,
+        'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案。',
+      };
+      return this.send(chat, { text: t[r] ?? `ℹ️ ${r}` });
+    }
+
+    const multi = rec.questions.length > 1;
+    // 分隔符与入站劫持正则保持一致：`,`、中文逗号、空白都接受
+    // （此前入站接受 `1 2`/`1，2` 并劫持消息，这里却只 split(',')，导致整条消息被吞掉后报"编号无效"）
+    const picks = [];
+    for (const token of String(picksRaw).split(/[,，\s]+/)) {
+      const t = token.trim();
+      if (!t) continue;
+      if (multi && t.includes('.')) {
+        const [q, o] = t.split('.').map((x) => Number(x));
+        picks.push({ qIndex: q - 1, oIndex: o - 1 });
+      } else {
+        // 多问题但只给裸编号 → 视为第 1 题的该选项；单问题 → 本就如此
+        picks.push({ qIndex: 0, oIndex: Number(t) - 1 });
+      }
+    }
+    if (picks.length === 0 || picks.some((p) => !Number.isInteger(p.oIndex) || p.oIndex < 0)) {
+      return this.send(chat, { text: '⚠️ 编号无效，请按卡片上的编号回复。' });
+    }
+
+    const custom = customParts.length ? customParts.join(' ') : undefined;
+    const result = this.userQuestions.respond(String(id), picks, custom, {
+      platform: msg.platform, chatId: msg.chatId,
+    }, isContinued ? { allowPartial: true } : {});
+    const texts = {
+      answered: `✅ 已回答提问 #${id}，agent 继续。`,
+      'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
+      invalid: isContinued
+        ? '⚠️ 编号无效（该提问此前已超时挂起，请按原卡片编号重发）。'
+        : '⚠️ 编号越界，提问仍在等待——请按卡片编号重发。',
+      forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+      continued: `✅ 已回答提问 #${id}（此前已超时挂起，答案已转交 agent）。`,
+      'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案——请让 agent 重新提问。',
+    };
+    await this.send(chat, { text: texts[result] ?? `ℹ️ ${result}` });
   }
 
   async commandTrust(msg, args) {

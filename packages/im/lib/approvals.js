@@ -57,7 +57,14 @@ export class ApprovalManager {
   /** 挂接 tools/pre-execute 门 + approval/request answerer。 */
   mount() {
     this._dispose.push(this.ctx.on('tools/pre-execute', (exec, next) => this.gate(exec, next)));
-    this._dispose.push(this.ctx.on('approval/request', (req, next) => this.answer(req, next)));
+    // prepend: true 是关键，与 user-questions 同因：
+    // Web 桥（api/remotes）也注册了 'approval/request' waterfall，把审批转发给浏览器。
+    // waterfall 中**先注册者先执行、先返回者认领**——GUI 转发器排在前面时会认领**所有**
+    // 审批（含 IM 会话的），IM 审批者永远不被调用，表现为「agent 卡在等审批，但钉钉
+    // 什么也没收到」。prepend 后 IM 会话自己应答，非 IM 会话 `next()` 委托回去，GUI 不变。
+    this._dispose.push(this.ctx.on('approval/request', (req, next) => this.answer(req, next), {
+      prepend: true,
+    }));
   }
 
   dispose() {
@@ -199,11 +206,16 @@ export class ApprovalManager {
     lines.push(`风险: ${record.risk}`);
     if (record.reason) lines.push(`原因: ${record.reason}`);
     lines.push(`会话: ${record.binding.sessionId}`);
+    // 正文自带用法提示：渲染不了按钮的渠道（钉钉 markdown）也能直接照做，
+    // 无需依赖适配器再追加一遍按钮文案。
+    lines.push(`回复：\`/approve ${record.id} yes\` 批准，或 \`/approve ${record.id} no\` 拒绝。`);
     return {
       text: lines.join('\n'),
+      // command 是给「渲染不了按钮」的渠道（如钉钉 markdown）用的文本降级，
+      // 必须是用户能直接复制发送的命令，而不是 approve:<id>:yes 这种内部载荷。
       buttons: [
-        { id: `approve:${record.id}:yes`, label: '✅ 批准', style: 'primary' },
-        { id: `approve:${record.id}:no`, label: '❌ 拒绝', style: 'danger' },
+        { id: `approve:${record.id}:yes`, label: '✅ 批准', style: 'primary', command: `/approve ${record.id} yes` },
+        { id: `approve:${record.id}:no`, label: '❌ 拒绝', style: 'danger', command: `/approve ${record.id} no` },
       ],
     };
   }

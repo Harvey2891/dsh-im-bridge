@@ -1,0 +1,524 @@
+// 用户提问应答者测试（无网络、无真实凭据）
+//
+// 回归点：IM 渠道此前没有任何 user-questions 应答者，agent 的 ask_user_question
+// 会落到 noAnswerer 并抛 NO_PROVIDER —— 用户什么都看不到，任务直接失败。
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
+import { UserQuestionAnswerer } from '../lib/user-questions.js';
+
+/** 构造 answerer + 捕获已推送消息。 */
+function makeAnswerer(cfg = {}) {
+  const sent = [];
+  const logs = [];
+  const map = {
+    bySessionId: (sid) => (sid === 'im-mock-c1' ? { platform: 'mock', chatId: 'c1' } : null),
+  };
+  const ctx = { on: () => () => {}, get: () => undefined };
+  const a = new UserQuestionAnswerer({
+    ctx,
+    map,
+    send: async (chat, out) => { sent.push({ chat, out }); },
+    logLine: (l) => logs.push(l),
+    cfg,
+  });
+  return { a, sent, logs };
+}
+
+const REQ = {
+  agent: { id: 'im-mock-c1' },
+  questions: [
+    {
+      id: 'q1',
+      question: '部署到哪个环境？',
+      header: '环境选择',
+      options: [
+        { label: 'staging', description: '预发' },
+        { label: 'production', description: '生产' },
+      ],
+    },
+  ],
+};
+
+test('把提问推成 IM 卡片，含编号选项与按钮', async () => {
+  const { a, sent } = makeAnswerer();
+  const p = a.answer(REQ, async () => { throw new Error('不该委托'); });
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.equal(sent.length, 1);
+  const card = sent[0].out;
+  assert.ok(card.text.includes('部署到哪个环境？'), '卡片包含问题');
+  assert.ok(card.text.includes('1. staging'), '卡片包含编号选项');
+  assert.ok(card.text.includes('2. production'));
+  assert.equal(card.buttons.length, 2, '每个选项一个按钮');
+  assert.deepEqual(card.buttons.map((b) => b.id), ['q:01:0:0', 'q:01:0:1']);
+
+  // 用户点第 2 个按钮
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 1 }]), 'answered');
+  const ans = await p;
+  assert.deepEqual(ans.answers, [{ id: 'q1', selected: ['production'] }]);
+});
+
+test('非 IM 会话必须委托给 next()（不能吞掉提问）', async () => {
+  const { a, sent } = makeAnswerer();
+  let delegated = false;
+  const out = await a.answer(
+    { agent: { id: 'some-gui-session' }, questions: REQ.questions },
+    async () => { delegated = true; return { answers: [] }; },
+  );
+  assert.equal(delegated, true, '非 IM 会话应调用 next() 委托');
+  assert.equal(sent.length, 0, '不应向 IM 推送');
+  assert.deepEqual(out, { answers: [] });
+});
+
+test('无选项的提问也能应答（自定义文字）', async () => {
+  const { a, sent } = makeAnswerer();
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: [{ id: 'q1', question: '项目叫什么？' }] },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(sent[0].out.text.includes('无预设选项'), '提示直接回复文字');
+  assert.equal(sent[0].out.buttons.length, 0);
+
+  assert.equal(a.respond('01', [], 'my-project'), 'answered');
+  const ans = await p;
+  assert.deepEqual(ans.answers, [{ id: 'q1', selected: [], custom: 'my-project' }]);
+});
+
+test('多问题：编号为 q.o，按钮载荷带问题序号', async () => {
+  const { a, sent } = makeAnswerer();
+  const p = a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: '环境？', options: [{ label: 'A' }, { label: 'B' }] },
+        { id: 'q2', question: '是否备份？', options: [{ label: '是' }, { label: '否' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent[0].out;
+  assert.ok(card.text.includes('1.1. A'), '多问题时编号为 问题序号.选项序号');
+  assert.deepEqual(
+    card.buttons.map((b) => b.id),
+    ['q:01:0:0', 'q:01:0:1', 'q:01:1:0', 'q:01:1:1'],
+  );
+
+  // 分别回答两个问题
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 1 }, { qIndex: 1, oIndex: 0 }]), 'answered');
+  const ans = await p;
+  assert.deepEqual(ans.answers, [
+    { id: 'q1', selected: ['B'] },
+    { id: 'q2', selected: ['是'] },
+  ]);
+});
+
+test('超时（timeoutSec>0）→ 返回空答案并提示，不阻塞', async () => {
+  const { a, sent } = makeAnswerer({ timeoutSec: 0.05 });
+  const p = a.answer(REQ, async () => { throw new Error('不该委托'); });
+  const ans = await p;
+  assert.deepEqual(ans.answers, []);
+  await new Promise((r) => setTimeout(r, 10));
+  assert.ok(sent.some((s) => s.out.text.includes('已超时')), '应提示超时');
+});
+
+test('重复应答：第二次返回 not-found（首答生效）', async () => {
+  const { a } = makeAnswerer();
+  const p = a.answer(REQ, async () => { throw new Error('不该委托'); });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 0 }]), 'answered');
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 1 }]), 'not-found');
+  await p;
+});
+
+test('skip：不选任何选项，返回空答案让 agent 自行决定', async () => {
+  const { a, sent } = makeAnswerer();
+  const p = a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: '环境？', options: [{ label: 'A' }, { label: 'B' }] },
+        { id: 'q2', question: '备份？', options: [{ label: '是' }, { label: '否' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 卡片上必须提示 skip 用法，否则用户不知道该能力存在
+  assert.ok(sent[0].out.text.includes('skip'), '卡片应提示 skip 用法');
+
+  assert.equal(a.skip('01'), 'skipped');
+  const ans = await p;
+  assert.deepEqual(ans.answers, [
+    { id: 'q1', selected: [] },
+    { id: 'q2', selected: [] },
+  ], 'skip 语义 = 空选择，agent 自行决定');
+
+  // 跳过后再应答不生效（已结束）
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 0 }]), 'not-found');
+  assert.equal(a.skip('01'), 'not-found');
+});
+
+test('skip 未知 id 返回 not-found', async () => {
+  const { a } = makeAnswerer();
+  assert.equal(a.skip('99'), 'not-found');
+});
+
+test('未知 id / 无效选项被拒绝', async () => {
+  const { a } = makeAnswerer();
+  assert.equal(a.respond('99', [{ qIndex: 0, oIndex: 0 }]), 'not-found');
+
+  const p = a.answer(REQ, async () => { throw new Error('不该委托'); });
+  await new Promise((r) => setTimeout(r, 10));
+  // 回归（P2-7）：越界编号必须**拒绝并保持等待**，不能静默丢弃后照样结题——
+  // 否则用户以为选上了，agent 却拿到空选择。
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 99 }]), 'invalid');
+  assert.equal(a.respond('01', [{ qIndex: 9, oIndex: 0 }]), 'invalid');
+  assert.equal(a.records.size, 1, '无效编号后提问必须仍在等待');
+  // 随后给合法编号仍能正常作答
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 1 }]), 'answered');
+  const ans = await p;
+  assert.deepEqual(ans.answers, [{ id: 'q1', selected: ['production'] }]);
+});
+
+test('回归：跨会话代答被拒绝（问题归属校验）', async () => {
+  const { a } = makeAnswerer();
+  const p = a.answer(REQ, async () => { throw new Error('不该委托'); });
+  await new Promise((r) => setTimeout(r, 10));
+  // 别的聊天里的用户（即使已授权）不能回答本会话的提问
+  assert.equal(
+    a.respond('01', [{ qIndex: 0, oIndex: 0 }], undefined, { platform: 'mock', chatId: 'other' }),
+    'forbidden',
+  );
+  assert.equal(a.records.size, 1, '被拒绝后提问必须仍在等待');
+  // 本会话可以
+  assert.equal(
+    a.respond('01', [{ qIndex: 0, oIndex: 0 }], undefined, { platform: 'mock', chatId: 'c1' }),
+    'answered',
+  );
+  await p;
+});
+
+test('回归：dispose 按 {answers} 契约结算（不是状态字符串）', async () => {
+  const { a } = makeAnswerer();
+  const p = a.answer(REQ, async () => { throw new Error('不该委托'); });
+  await new Promise((r) => setTimeout(r, 10));
+  a.dispose();
+  const ans = await p;
+  assert.deepEqual(ans, { answers: [] }, 'dispose 必须返回合法应答契约');
+  assert.equal(a.records.size, 0);
+});
+
+test('回归：id 不回绕复用（旧等待记录不被覆盖）', async () => {
+  const { a } = makeAnswerer();
+  const p1 = a.answer(REQ, async () => { throw new Error('不该委托'); });
+  await new Promise((r) => setTimeout(r, 10));
+  const first = [...a.records.keys()][0];
+  // 若仍用 %999 回绕，再分配 1200 次后会重新发到 first 并覆盖旧记录
+  for (let i = 0; i < 1200; i++) a._nextId();
+  const reused = a._nextId();
+  assert.notEqual(reused, first, '新 id 不得复用仍在等待的 id');
+  assert.equal(a.records.size, 1, '旧等待记录必须仍在');
+  assert.equal(a.respond(first, [{ qIndex: 0, oIndex: 0 }]), 'answered');
+  await p1;
+});
+
+test('回归：发送挂起期间 abort 必须 reject（不得永久等待）', async () => {
+  let releaseSend;
+  const sendGate = new Promise((r) => { releaseSend = r; });
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => { await sendGate; },   // 发送一直挂起
+    logLine: () => {},
+    cfg: {},
+  });
+  const ac = new AbortController();
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: REQ.questions, signal: ac.signal },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  ac.abort();   // 发送仍在挂起时取消
+  await assert.rejects(p, (e) => e.code === 'ABORTED', 'abort 必须 reject 而不是挂着');
+  assert.equal(a.records.size, 0, 'abort 后不得残留等待记录');
+  releaseSend();
+});
+
+test('回归：timed 请求 abort 抛 ASK_TIMED_OUT（保留 continued 语义）', async () => {
+  const { a } = makeAnswerer();
+  const ac = new AbortController();
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: REQ.questions, signal: ac.signal, wait: { callId: 'c1', timed: true } },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  ac.abort();
+  // DSH 靠异常码区分「超时挂起（可续答）」与「用户真答了空」
+  await assert.rejects(p, (e) => e.code === 'ASK_TIMED_OUT');
+});
+
+test('回归：abort 后不再推送卡片（注册前已 abort）', async () => {
+  const { a, sent } = makeAnswerer();
+  const ac = new AbortController();
+  ac.abort();
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: REQ.questions, signal: ac.signal },
+    async () => { throw new Error('不该委托'); },
+  );
+  await assert.rejects(p, (e) => e.code === 'ABORTED');
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(sent.length, 0, '已 abort 就不该再推卡片');
+});
+
+test('回归：多问题卡片按钮逐题累计，答全才结题（不再点一题就提交）', async () => {
+  const sent = [];
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async (chat, out) => { sent.push(out); },
+    logLine: () => {},
+    cfg: {},
+  });
+  const p = a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const id = [...a.records.keys()][0];
+  const from = { platform: 'mock', chatId: 'c1' };
+
+  // round-3 发现：点第一题**不能**立刻结题（否则第二题被当成空答案、余下按钮失效）
+  const first = a.accumulate(id, [{ qIndex: 0, oIndex: 1 }], from);
+  assert.equal(first.status, 'partial', '未答全应保持等待');
+  assert.equal(first.answered, 1);
+  assert.equal(first.total, 2);
+  assert.equal(first.label, 'a2', '应回报已选项，便于用户确认');
+  assert.equal(a.records.size, 1, '提问必须仍在等待');
+
+  // 点第二题 → 答全 → 自动提交，且两题都是用户真实选择
+  const second = a.accumulate(id, [{ qIndex: 1, oIndex: 0 }], from);
+  assert.equal(second.status, 'answered');
+  const ans = await p;
+  assert.deepEqual(ans.answers, [
+    { id: 'q1', selected: ['a2'] },
+    { id: 'q2', selected: ['b1'] },
+  ], '两题都必须是用户点的，不能被空答案顶替');
+});
+
+test('回归：/answer done 提交草稿（未答的题按跳过）', async () => {
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => {},
+    logLine: () => {},
+    cfg: {},
+  });
+  const p = a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const id = [...a.records.keys()][0];
+  const from = { platform: 'mock', chatId: 'c1' };
+  a.accumulate(id, [{ qIndex: 0, oIndex: 0 }], from);
+  assert.equal(a.commitDraft(id, from), 'answered');
+  const ans = await p;
+  assert.deepEqual(ans.answers, [
+    { id: 'q1', selected: ['a1'] },
+    { id: 'q2', selected: [] },
+  ], '提交后未答的题按跳过处理');
+});
+
+test('回归：无任何选择时 done 被拒（不伪造结题）', async () => {
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => {},
+    logLine: () => {},
+    cfg: {},
+  });
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: [{ id: 'q1', question: 'A?', options: [{ label: 'a1' }] }] },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const id = [...a.records.keys()][0];
+  assert.equal(a.commitDraft(id, { platform: 'mock', chatId: 'c1' }), 'empty');
+  assert.equal(a.records.size, 1, '仍应等待');
+  a.accumulate(id, [{ qIndex: 0, oIndex: 0 }], { platform: 'mock', chatId: 'c1' });
+  await p;
+});
+
+test('回归：文字命令路径必须答全（未答的题返回 invalid 并保持等待）', async () => {
+  const { a } = makeAnswerer();
+  const p = a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const id = [...a.records.keys()][0];
+  assert.equal(
+    a.respond(id, [{ qIndex: 0, oIndex: 0 }], undefined, { platform: 'mock', chatId: 'c1' }),
+    'invalid',
+    '文字路径下只答一题应提示 invalid',
+  );
+  assert.equal(a.records.size, 1, '必须仍在等待');
+  assert.equal(
+    a.respond(id, [{ qIndex: 0, oIndex: 0 }, { qIndex: 1, oIndex: 1 }], undefined, { platform: 'mock', chatId: 'c1' }),
+    'answered',
+  );
+  await p;
+});
+
+test('回归：single-select 多选被拒；multiSelect 允许多选', async () => {
+  const { a } = makeAnswerer();
+  const p = a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [{ id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] }],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const id = [...a.records.keys()][0];
+  assert.equal(
+    a.respond(id, [{ qIndex: 0, oIndex: 0 }, { qIndex: 0, oIndex: 1 }], undefined, { platform: 'mock', chatId: 'c1' }),
+    'invalid',
+    'single-select 选两项必须拒绝',
+  );
+  assert.equal(a.respond(id, [{ qIndex: 0, oIndex: 0 }], undefined, { platform: 'mock', chatId: 'c1' }), 'answered');
+  await p;
+});
+
+test('回归：timed 超时后迟答经 DSH 继续协议转交（continued）', async () => {
+  const delivered = [];
+  const svc = {
+    answer: (agent, callId, answer) => { delivered.push({ agent, callId, answer }); return true; },
+  };
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: (k) => (k === 'userQuestions' ? svc : undefined) },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => {},
+    logLine: () => {},
+    cfg: {},
+  });
+  const ac = new AbortController();
+  const agent = { id: 'im-mock-c1' };
+  const p = a.answer(
+    { agent, questions: REQ.questions, signal: ac.signal, wait: { callId: 'call-9', timed: true } },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  ac.abort();
+  await assert.rejects(p, (e) => e.code === 'ASK_TIMED_OUT', '前台必须 reject 以便 DSH 得到 pending');
+  // 记录转入 continued，迟答仍能找到入口（round-2 发现 5）
+  assert.equal(a.records.size, 0);
+  assert.equal(a.continued.size, 1, 'timed 超时后记录必须保留在 continued');
+  const id = [...a.continued.keys()][0];
+  assert.equal(
+    a.respond(id, [{ qIndex: 0, oIndex: 1 }], undefined, { platform: 'mock', chatId: 'c1' }),
+    'continued',
+    '迟答必须经继续协议转交',
+  );
+  // eslint-disable-next-line no-unused-expressions
+  assert.equal(delivered.length, 1, '必须调用 userQuestions.answer(agent, callId, answers)');
+  assert.equal(delivered[0].callId, 'call-9');
+  assert.equal(delivered[0].agent, agent);
+  assert.deepEqual(delivered[0].answer.answers, [{ id: 'q1', selected: ['production'] }]);
+  assert.equal(a.continued.size, 0, '转交成功后应清理');
+});
+
+test('回归：无 DSH 继续服务时，迟答明确报无法转交（不静默成功）', async () => {
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },   // 服务不可用
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => {},
+    logLine: () => {},
+    cfg: {},
+  });
+  const ac = new AbortController();
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: REQ.questions, signal: ac.signal, wait: { callId: 'c1', timed: true } },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  ac.abort();
+  await assert.rejects(p);
+  const id = [...a.continued.keys()][0];
+  assert.equal(
+    a.respond(id, [{ qIndex: 0, oIndex: 0 }], undefined, { platform: 'mock', chatId: 'c1' }),
+    'no-continuation',
+  );
+});
+
+test('推送失败 → 不阻塞 agent（fail closed 返回空答案）', async () => {
+  const sent = [];
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => { throw new Error('channel down'); },
+    logLine: () => {},
+    cfg: {},
+  });
+  const ans = await a.answer(REQ, async () => { throw new Error('不该委托'); });
+  assert.deepEqual(ans, { answers: [] }, '推送失败应返回空答案而不是卡住');
+  assert.equal(sent.length, 0);
+});
+
+test('mount() 注册 waterfall 监听；dispose() 清理', () => {
+  const handlers = [];
+  const a = new UserQuestionAnswerer({
+    ctx: { on: (evt, fn, opts) => { handlers.push({ evt, fn, opts }); return () => {}; }, get: () => undefined },
+    map: {},
+    send: async () => {},
+    cfg: {},
+  });
+  a.mount();
+  assert.equal(handlers.length, 1);
+  assert.equal(handlers[0].evt, 'user-questions/request');
+  // prepend 是关键：GUI 桥也会注册同一 waterfall 并转发给浏览器；先注册者先执行、
+  // 先返回者认领。不 prepend 就永远轮不到 IM 应答者（症状：IM 收不到选项）。
+  assert.equal(
+    handlers[0].opts?.prepend,
+    true,
+    '必须以 prepend 注册，否则会被 GUI 转发器抢先认领',
+  );
+  a.dispose();
+});
+
+test('enabled=false 时不注册（交由其他应答者）', () => {
+  const handlers = [];
+  const a = new UserQuestionAnswerer({
+    ctx: { on: (evt, fn) => { handlers.push({ evt, fn }); return () => {}; }, get: () => undefined },
+    map: {},
+    send: async () => {},
+    cfg: { enabled: false },
+  });
+  a.mount();
+  assert.equal(handlers.length, 0);
+});

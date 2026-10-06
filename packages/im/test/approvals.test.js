@@ -34,6 +34,48 @@ const exec = (tool, args, agentId = 'im-mock-c1') => ({
   agent: { id: agentId },
 });
 
+// ── 回归：审批监听必须 prepend（否则被 GUI 桥抢答，IM 收不到审批） ──────────
+
+test('回归：approval/request 监听以 prepend 注册', () => {
+  const handlers = [];
+  const dir = mkdtempSync(join(tmpdir(), 'im-ap-'));
+  const map = new SessionMap(dir);
+  const mgr = new ApprovalManager({
+    ctx: {
+      on: (evt, fn, opts) => { handlers.push({ evt, fn, opts }); return () => {}; },
+    },
+    map,
+    send: async () => ({}),
+    logLine: () => {},
+  });
+  mgr.mount();
+  const approval = handlers.find((h) => h.evt === 'approval/request');
+  assert.ok(approval, '应注册 approval/request 监听');
+  // Web 桥也注册同一 waterfall 并转发给浏览器；不 prepend 就永远轮不到 IM 审批者
+  // （症状：agent 卡在等审批，钉钉什么都收不到）。
+  assert.equal(approval.opts?.prepend, true, '必须以 prepend 注册，否则被 GUI 转发器抢先认领');
+  // tools/pre-execute 不经 GUI 转发，无需 prepend
+  const gate = handlers.find((h) => h.evt === 'tools/pre-execute');
+  assert.ok(gate, '应注册 tools/pre-execute 监听');
+});
+
+test('审批卡片正文自带 /approve 用法（无按钮渠道可直接照做）', async () => {
+  const { mgr, sent } = makeManager({ timeoutSec: 60 });
+  const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash' };
+  const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
+  await new Promise((r) => setTimeout(r, 20));
+  const card = sent.find((m) => m.buttons?.length);
+  assert.ok(card, '应推送审批卡片');
+  assert.ok(/\/approve \S+ yes/.test(card.text), '正文应含可直接发送的 /approve <id> yes');
+  assert.ok(/\/approve \S+ no/.test(card.text), '正文应含 /approve <id> no');
+  // 按钮带 command：钉钉渲染不了按钮，降级时要用友好命令而非内部载荷
+  const id = card.buttons[0].id.split(':')[1];
+  assert.equal(card.buttons[0].command, `/approve ${id} yes`);
+  assert.equal(card.buttons[1].command, `/approve ${id} no`);
+  mgr.respond(id, 'no', { platform: 'mock', userId: 'u1' });
+  await p;
+});
+
 test('pre-execute 门：高危 → ask；低危 → next()', async () => {
   const { mgr } = makeManager();
   const next = async () => ({ kind: 'allow' });

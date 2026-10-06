@@ -179,6 +179,407 @@ test('回归：agent.preset 可配置（非 standard 时按配置挂载）', asy
   }
 });
 
+// ── 回归：出站必须把平台 userId 下传给渠道 ──────────────────────────────────
+//
+// 症状：钉钉里审批卡片、提问卡片都收不到，且无明显报错。
+// 根因：钉钉 sessionWebhook 是会话级短期凭证，过期后出站降级到「机器人主动推送」，
+//       而那条路径要求**平台 userId**；dsh-im 传来的 chatId 却是 conversationId
+//       （会话级不透明串），平台返回 staffId.notExisted。适配器当时只依赖自己入站
+//       学到的**内存**映射，进程一重启就丢，于是降级路径必然用错值并静默失败。
+// 修复：核心层从**持久化**会话映射取 userId 一并下传（out.userId）。
+
+test('回归：出站把持久化会话映射里的 userId 下传给渠道', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: '收到' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    // 入站带 userId → 会话映射记录该用户
+    await mock.sendFromUser({ text: '你好', userId: 'user-42' });
+    await waitFor(() => mock.sent.length > 0, { label: 'outbound message', timeoutMs: 8000 });
+
+    // 所有出站消息都应带上该会话的 userId，渠道才能主动推送
+    const missing = mock.sent.filter((m) => m.userId !== 'user-42');
+    assert.equal(
+      missing.length,
+      0,
+      `出站消息必须带 userId（渠道据此主动推送）；缺失 ${missing.length} 条：`
+      + JSON.stringify(missing.slice(0, 2).map((m) => ({ chatId: m.chatId, text: m.text?.slice(0, 30) }))),
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+// ── /answer skip：跳过选择，让 agent 自行决定 ───────────────────────────────
+
+test('/answer skip：跳过提问并把空答案回传（agent 自行决定继续）', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: '收到' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    const sessionId = im.map.get('mock', 'chat-1').sessionId;
+
+    // 直接走应答者，模拟 agent 提问
+    let delegated = false;
+    const p = im.userQuestions.answer(
+      {
+        agent: { id: sessionId },
+        questions: [
+          { id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] },
+          { id: 'q2', question: '要不要备份？', options: [{ label: '要' }, { label: '不要' }] },
+        ],
+      },
+      async () => { delegated = true; return { answers: [] }; },
+    );
+    await waitFor(() => im.userQuestions.records.size > 0, { label: 'question pushed', timeoutMs: 8000 });
+    assert.equal(delegated, false, 'IM 会话应由 IM 应答者认领');
+
+    const qid = [...im.userQuestions.records.keys()][0];
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, 'skip']);
+
+    const ans = await p;
+    assert.deepEqual(
+      ans.answers,
+      [{ id: 'q1', selected: [] }, { id: 'q2', selected: [] }],
+      'skip 必须回传空选择，agent 才能自行决定',
+    );
+    assert.ok(
+      mock.sent.some((m) => m.text?.includes('已跳过')),
+      '应回执「已跳过」',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+// ── /answer <id> <编号>：选编号（主要用法） ─────────────────────────────────
+
+async function pushQuestion(im, questions) {
+  const sessionId = im.map.get('mock', 'chat-1').sessionId;
+  const p = im.userQuestions.answer({ agent: { id: sessionId }, questions }, async () => {
+    throw new Error('不该委托');
+  });
+  await waitFor(() => im.userQuestions.records.size > 0, { label: 'question pushed', timeoutMs: 8000 });
+  const qid = [...im.userQuestions.records.keys()][0];
+  return { p, qid };
+}
+
+const QSCRIPT = [
+  {
+    chunks: [
+      { type: 'text-delta', index: 0, text: '收到' },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ],
+  },
+];
+
+test('/answer <编号>：多问题按 问题号.选项号 选中，selected 非空', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '环境？', options: [{ label: 'staging' }, { label: 'production' }] },
+      { id: 'q2', question: '备份？', options: [{ label: '要' }, { label: '不要' }] },
+    ]);
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '1.2,2.1']);
+
+    const ans = await p;
+    assert.deepEqual(ans.answers, [
+      { id: 'q1', selected: ['production'] },
+      { id: 'q2', selected: ['要'] },
+    ], '按编号必须选中对应选项（不能是空选择）');
+    assert.ok(mock.sent.some((m) => m.text?.includes('已回答')), '应回执「已回答」');
+  } finally {
+    await teardown();
+  }
+});
+
+test('/answer <编号>：单问题直接写序号', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }, { label: 'C' }] },
+    ]);
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '3']);
+
+    assert.deepEqual((await p).answers, [{ id: 'q1', selected: ['C'] }]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('/answer <编号> <文字>：选编号并附自定义文字', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] },
+    ]);
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '2', '顺便', '加日志']);
+
+    assert.deepEqual((await p).answers, [{ id: 'q1', selected: ['B'], custom: '顺便 加日志' }]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('/answer <编号>：越界编号被拒绝，提问仍可正常回答', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选哪个？', options: [{ label: 'A' }, { label: 'B' }] },
+    ]);
+    // 负编号 → 直接拒绝，不应把提问结束掉
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '-1']);
+    assert.ok(mock.sent.some((m) => m.text?.includes('编号无效')), '应提示编号无效');
+    assert.equal(im.userQuestions.records.size, 1, '提问应仍然待答，不能被误判为已答');
+
+    // 随后用有效编号仍能正常回答
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '1']);
+    assert.deepEqual((await p).answers, [{ id: 'q1', selected: ['A'] }]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('直接回数字即作答：不必记 /answer 语法，也不会中断回合', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p } = await pushQuestion(im, [
+      { id: 'q1', question: '环境？', options: [{ label: 'staging' }, { label: 'production' }] },
+    ]);
+    const before = mock.sent.length;
+
+    // 用户只回一个数字
+    await mock.sendFromUser({ text: '2' });
+
+    assert.deepEqual((await p).answers, [{ id: 'q1', selected: ['production'] }],
+      '回数字必须被当成作答，而不是新任务');
+    assert.ok(
+      mock.sent.slice(before).some((m) => m.text?.includes('已回答')),
+      '应回执「已回答」',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+test('直接回 skip 即跳过', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p } = await pushQuestion(im, [
+      { id: 'q1', question: '环境？', options: [{ label: 'A' }, { label: 'B' }] },
+    ]);
+    await mock.sendFromUser({ text: 'skip' });
+    assert.deepEqual((await p).answers, [{ id: 'q1', selected: [] }]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('无待答提问时，数字仍是普通消息（不劫持）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    assert.equal(im.userQuestions.records.size, 0);
+
+    // 没有待答提问 → 「2」应作为普通任务派给 agent，而不是被当成作答
+    await mock.sendFromUser({ text: '2' });
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('收到')), { label: 'agent reply', timeoutMs: 8000 });
+  } finally {
+    await teardown();
+  }
+});
+
+test('出站：渠道声明 maxMessageBytes 时按字节分段发送（不超限、不丢内容）', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: '收到' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    mock.maxMessageBytes = 300; // 让渠道声明很小的字节上限
+    const long = '中文内容测试'.repeat(200); // 1200 字 ≈ 3600 字节
+    await im.send({ platform: 'mock', chatId: 'chat-1' }, { text: long });
+
+    const mine = mock.sent.filter((m) => m.text?.includes('中文内容测试'));
+    assert.ok(mine.length > 1, `超限必须分段（实际 ${mine.length} 段）`);
+    for (const m of mine) {
+      assert.ok(
+        Buffer.byteLength(m.text, 'utf8') <= 300,
+        `每段必须 ≤300 字节（实际 ${Buffer.byteLength(m.text, 'utf8')}）`,
+      );
+    }
+    assert.ok(mine[0].text.startsWith('(1/'), '应带 (i/n) 序号');
+    // 去掉序号后拼回必须等于原文（splitByBytes 的无损不变式）
+    const rejoined = mine.map((m) => {
+      const idx = m.text.indexOf(') ');
+      return m.text.startsWith('(') ? m.text.slice(idx + 2) : m.text;
+    }).join('');
+    assert.equal(rejoined, long, '分段必须无损');
+  } finally {
+    await teardown();
+  }
+});
+
+test('出站：渠道未声明 maxMessageBytes 时不分段', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: '收到' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    const long = 'x'.repeat(5000);
+    await im.send({ platform: 'mock', chatId: 'chat-1' }, { text: long });
+    assert.equal(mock.sent.filter((m) => m.text === long).length, 1, '未声明上限则原样发送');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：分段时按钮命令块不被切开（可整条复制）', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: '收到' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    mock.maxMessageBytes = 300;
+    mock.buttonsAsText = true;   // 文本型渠道：核心负责把按钮渲染进正文
+    const buttons = [
+      { id: 'a:1', label: '批准', command: '/approve aaaaaaaa yes' },
+      { id: 'a:2', label: '拒绝', command: '/approve aaaaaaaa no' },
+    ];
+    const long = '中文正文内容'.repeat(80);   // ≈ 1440 字节，必然分段
+    await im.send({ platform: 'mock', chatId: 'chat-1' }, { text: long, buttons });
+
+    const mine = mock.sent.filter((m) => m.text?.includes('正文内容') || m.text?.includes('/approve'));
+    assert.ok(mine.length > 1, `应分段（实际 ${mine.length} 段）`);
+    for (const m of mine) {
+      assert.ok(Buffer.byteLength(m.text, 'utf8') <= 300, `每段 ≤300 字节（实际 ${Buffer.byteLength(m.text, 'utf8')}）`);
+    }
+    // 每条命令都必须完整出现在**某一段**里（不能被切断）
+    const joinedSegments = mine.map((m) => m.text);
+    for (const b of buttons) {
+      assert.ok(
+        joinedSegments.some((t) => t.includes(b.command)),
+        `命令 ${b.command} 必须完整落在某一段内`,
+      );
+    }
+    // 且不得重复渲染（核心渲染后适配器不应再追加）
+    const occurrences = joinedSegments.join('\n').split('/approve aaaaaaaa yes').length - 1;
+    assert.equal(occurrences, 1, '命令不得重复');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：按钮回调走逐题累计（第一次 partial 且保留记录，第二次才结题）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+      { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+    ]);
+
+    // 第一次点击：应为 partial（记录保留、回执含进度），而不是把第二题当空答案提交
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'user-1', userName: 'Tester',
+      data: `q:${qid}:0:1`,
+    });
+    assert.equal(im.userQuestions.records.size, 1, '第一次点击后必须仍在等待');
+    assert.ok(
+      mock.sent.some((m) => m.text?.includes('进度 1/2')),
+      '应回报累计进度',
+    );
+
+    // 第二次点击：答全 → 自动结题
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'user-1', userName: 'Tester',
+      data: `q:${qid}:1:0`,
+    });
+    const ans = await p;
+    assert.deepEqual(ans.answers, [
+      { id: 'q1', selected: ['a2'] },
+      { id: 'q2', selected: ['b1'] },
+    ], '两题都必须是用户点的，不能被空答案顶替');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：混合题型（有选项 + 自由文本）不得被按钮自动结题', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选一个', options: [{ label: 'a' }, { label: 'b' }] },
+      { id: 'q2', question: '项目叫什么？' },   // 自由文本题，按钮无法作答
+    ]);
+
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'user-1', userName: 'Tester',
+      data: `q:${qid}:0:0`,
+    });
+    // round-4 发现：含自由文本题时不能自动结题，否则该题被伪造成空答案
+    assert.equal(im.userQuestions.records.size, 1, '含自由文本题时必须继续等待');
+    assert.ok(
+      mock.sent.some((m) => m.text?.includes('自由文本题')),
+      '应告知按钮无法完成该题',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
 test('派活 → 审批 → 放行 → 结果卡片（全链路）', async () => {
   const script = [
     {
