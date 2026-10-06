@@ -37,14 +37,23 @@ const MAX_BYTES_FOR_CODE = 3000;
  */
 function shortenForDisplay(name, maxBytes) {
   const s = String(name ?? '');
-  const limit = Math.max(8, Math.floor(maxBytes));
+  // 🔴 严格尊重传入上限：此前 `Math.max(8, …)` 会把 <8 的请求悄悄放大到 8，
+  // 违反"结果不超过 maxBytes"的语义（round-6 P3）。
+  const limit = Math.max(1, Math.floor(maxBytes));
   if (Buffer.byteLength(s, 'utf8') <= limit) return s;
+  const ELLIPSIS = '…';
+  const ellBytes = Buffer.byteLength(ELLIPSIS, 'utf8');
+  if (limit <= ellBytes) {
+    // 连省略号都放不下：尽量放进第一个码点；放不下就返回空串
+    const first = [...s][0] ?? '';
+    return Buffer.byteLength(first, 'utf8') <= limit ? first : '';
+  }
   const chars = [...s];
   const head = [];
   const tail = [];
-  // 先各留一半预算，再从尾部补足
   let used = 0;
-  const budget = limit - Buffer.byteLength('…', 'utf8');
+  const budget = limit - ellBytes;
+  // 先各留一半预算，再从尾部补足
   for (const ch of chars) {
     const n = Buffer.byteLength(ch, 'utf8');
     if (used + n > budget / 2) break;
@@ -58,7 +67,7 @@ function shortenForDisplay(name, maxBytes) {
     tail.unshift(ch);
     used += n;
   }
-  return `${head.join('')}…${tail.join('')}`;
+  return `${head.join('')}${ELLIPSIS}${tail.join('')}`;
 }
 
 const Config = z.object({
@@ -396,6 +405,16 @@ export function apply(ctx, config = {}, internals = {}) {
         + '无 sessionWebhook，文件/全文无法投递（请让用户先发一条消息以刷新 webhook）',
       );
       return { failed: true, reason: 'no-delivery-path' };
+    }
+    // 🔴 必须像 deliver() 一样检查过期：sessionWebhook 是**会话级短期凭证**，
+    // 过期后仍向旧 URL 投递会失败，而 /log 是用户唯一的"取全文"入口
+    // （round-6 P2）。过期就直接如实上报，让用户刷新会话后重试。
+    if (hook.expiresAt && hook.expiresAt <= Date.now()) {
+      logger.error(
+        'dsh-im-dingtalk: sendFile sessionWebhook expired | '
+        + 'sessionWebhook 已过期，全文无法投递（让用户随便发一条消息即可刷新）',
+      );
+      return { failed: true, reason: 'webhook-expired' };
     }
     try {
       const raw = String(text ?? '');

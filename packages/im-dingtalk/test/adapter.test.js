@@ -529,6 +529,37 @@ test('回归：超长文件名（含 sessionId）不得让单条消息超限', a
   assert.ok(sent[0].text.content.includes('…'), '超长文件名应被无损缩短显示');
 });
 
+test('回归：sessionWebhook 已过期时 sendFile 必须上报失败（不得盲投旧 URL）', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  let posted = false;
+  const fetchImpl = async (url) => {
+    if (String(url).includes('gettoken')) {
+      return { ok: true, json: async () => ({ errcode: 0, access_token: 'tok', expires_in: 7200 }) };
+    }
+    posted = true;
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1',
+      sessionWebhook: 'https://hook.example/old',
+      sessionWebhookExpiredTime: Date.now() - 60_000,   // 已过期
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const r = await captured.channel.sendFile('cid-1', 'log.md', '全文内容', 'text/markdown');
+  // round-6 P2：deliver() 会检查过期并回退，sendFile 此前不检查 → 盲投旧 URL
+  assert.equal(r.failed, true, '过期 webhook 必须上报失败');
+  assert.equal(r.reason, 'webhook-expired');
+  assert.equal(posted, false, '不得向已过期的 URL 投递');
+});
+
 test('回归：无 sessionWebhook 时 sendFile 必须上报失败（不得静默成功）', async () => {
   const { ctx, captured } = makeCtx();
   const { sdk } = makeSdkStub();

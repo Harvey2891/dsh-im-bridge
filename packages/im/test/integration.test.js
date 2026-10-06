@@ -580,7 +580,7 @@ test('回归：混合题型（有选项 + 自由文本）不得被按钮自动�
   }
 });
 
-test('回归：混合题型回文字可完成提问（提示与实际行为一致）', async () => {
+test('回归：混合题型用显式 `/answer text` 填文字题并完成', async () => {
   const { mock, im, teardown } = await setup(QSCRIPT);
   try {
     await mock.sendFromUser({ text: '你好' });
@@ -597,15 +597,62 @@ test('回归：混合题型回文字可完成提问（提示与实际行为一�
     });
     assert.equal(im.userQuestions.records.size, 1, '含自由文本题时先保持等待');
 
-    // 再直接回文字 → 应填入自由文本题并完成整批
-    // （round-5 发现 1：此前混合题型的普通文字会落进派活，提问永久挂着）
-    await mock.sendFromUser({ text: '我的项目名' });
+    // 混合题型的文字题必须用**显式**语法（round-6：普通文字不再被吞，避免丢任务）
+    await im.commandAnswer(
+      { platform: 'mock', chatId: 'chat-1', userId: 'user-1' },
+      [qid, 'text', '我的', '项目名'],
+    );
 
     const ans = await p;
     assert.deepEqual(ans.answers, [
       { id: 'q1', selected: ['b'] },
-      { id: 'q2', selected: [], custom: '我的项目名' },
+      { id: 'q2', selected: [], custom: '我的 项目名' },
     ], '文字必须填入自由文本题，且与选项题的答案一起提交');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：混合题型的普通文字**不再**被吞（保护用户新任务）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选一个', options: [{ label: 'a' }, { label: 'b' }] },
+      { id: 'q2', question: '项目叫什么？' },
+    ]);
+    const before = mock.sent.length;
+
+    // 用户本意是派新任务 → 不得被当成问卷答案（否则任务丢失，round-6 P2）
+    await mock.sendFromUser({ text: '部署生产环境' });
+
+    assert.equal(im.userQuestions.records.size, 1, '提问应仍在等待');
+    const rec = im.userQuestions.records.get(qid);
+    assert.equal(rec.draftCustom.size, 0, '文字不得被吞成答案');
+    // 该消息应作为新任务被派给 agent（而非静默丢弃）
+    await waitFor(
+      () => mock.sent.slice(before).some((m) => m.text?.includes('收到')),
+      { label: 'agent 收到新任务', timeoutMs: 8000 },
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：纯文字题卡片回数字应作为文字答案（不是选项编号）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p } = await pushQuestion(im, [{ id: 'q1', question: '工单号？' }]);
+    // 纯文字题卡片没有可选项 → 「123」必须是文字答案（round-6 P2）
+    await mock.sendFromUser({ text: '123' });
+
+    const ans = await p;
+    assert.deepEqual(ans.answers, [{ id: 'q1', selected: [], custom: '123' }]);
   } finally {
     await teardown();
   }
@@ -651,6 +698,28 @@ test('回归：continued 状态下 done 仍能提交草稿（草稿不白丢）'
     { id: 'q1', selected: ['a2'] },
     { id: 'q2', selected: [] },
   ]);
+});
+
+test('回归：原生按钮渠道分段时按钮只出现在最后一段', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    mock.maxMessageBytes = 300;
+    // 不声明 buttonsAsText → 按钮走原生渲染，核心必须保留它们
+    const buttons = [
+      { id: 'a:1', label: '批准', command: '/approve a yes' },
+      { id: 'a:2', label: '拒绝', command: '/approve a no' },
+    ];
+    await im.send({ platform: 'mock', chatId: 'chat-1' }, { text: 'x'.repeat(1200), buttons });
+
+    const segs = mock.sent.filter((m) => m.text?.includes('x'));
+    assert.ok(segs.length > 1, `应分段（实际 ${segs.length}）`);
+    const withButtons = segs.filter((m) => m.buttons?.length);
+    // round-6 P2：此前每段都带按钮，用户点前面的会拿到 not-found（无效操作）
+    assert.equal(withButtons.length, 1, '按钮只能出现在一段里');
+    assert.equal(withButtons[0], segs[segs.length - 1], '必须在最后一段');
+  } finally {
+    await teardown();
+  }
 });
 
 test('派活 → 审批 → 放行 → 结果卡片（全链路）', async () => {

@@ -318,27 +318,30 @@ export class ImRuntime extends Service {
     const total = parts.length + (cmdOwnSegment ? 1 : 0);
 
     let last;
+    // 带按钮的原生渠道（未声明 buttonsAsText）：按钮**只在整体最后一条**消息上。
+    // 每段都带会让用户点击前面那些已失效的按钮（返回 not-found），是无效操作。
+    const lastBodyIdx = cmdOwnSegment ? -1 : parts.length - 1;
     for (let i = 0; i < parts.length; i++) {
-      const isLastBody = i === parts.length - 1;
+      const isLastBody = i === lastBodyIdx;
       last = await this._dispatch(channel, {
         ...body,
         text: `(${i + 1}/${total}) ${parts[i]}`,
-        // 附件只在最后一段附带（每段都带会被重复投递）
-        ...(isLastBody && !cmdOwnSegment ? {} : { attachments: undefined }),
+        // 按钮与附件都只在最后一段：附件每段都带会被重复投递
+        ...(isLastBody ? {} : { buttons: undefined, attachments: undefined }),
       });
     }
     if (cmdOwnSegment) {
       const cmdParts = splitByBytes(commands, Math.max(1, maxBytes - reserve));
       for (let j = 0; j < cmdParts.length; j++) {
         const idx = parts.length + j + 1;
+        const isVeryLast = j === cmdParts.length - 1;
         last = await this._dispatch(channel, {
           ...body,
           text: `(${idx}/${total}) ${cmdParts[j]}`,
-          attachments: undefined,
+          ...(isVeryLast ? { attachments: undefined } : { buttons: undefined, attachments: undefined }),
         });
       }
     }
-    return last;
     return last;
   }
 
@@ -406,38 +409,51 @@ export class ImRuntime extends Service {
       return;
     }
 
-    // 待答提问优先：直接回「数字」或「skip」即视为作答，不必记 `/answer <id> <编号>` 语法。
-    // 这同时填掉一个坑：提问等待期间再发普通消息会让当前回合被中断（turn/end aborted by
-    // user），而中断时提问只能以**空答案**收场。先在此处消费掉答案，就不会误触发中断。
+    // 待答提问：只消费**无歧义**的作答形式，其余留给用户表达真实意图。
+    //
+    // 统一作答语法（round-6 重构）：
+    //   · 选项题  → 卡片有待选项时，直接回数字；或 `/answer <id> <编号>`
+    //   · 文字题  → 仅当**整张卡片都是文字题**时，普通文字自动当答案；
+    //               混合题型必须用显式 `/answer <id> text <内容>`
+    //   · 跳过    → `skip` / `/answer <id> skip`
+    //   · 提交    → `/answer <id> done`
+    //
+    // 🔴 为什么混合题型的普通文字**不**再自动当答案：此前只要存在未填文字题，任何非命令
+    // 文本都会被吃成答案 —— 用户本想派的新任务（如「部署生产环境」）会**丢失**
+    // （round-6 P2）。代价是混合题型要显式写 `text`，卡片已写明。
     const pendingQ = this.userQuestions?.pendingFor(platform, chatId);
     if (pendingQ && text) {
       const t = text.trim();
       const isSkip = /^(skip|跳过)$/i.test(t);
       const isChoice = /^\d+(\.\d+)?([,，\s]+\d+(\.\d+)?)*$/.test(t);
-      if (isSkip || isChoice) {
-        await this.commandAnswer(msg, [pendingQ.id, t]);
-        return;
-      }
-      // 自由文本作答：把这条文本填进**尚未作答的自由文本题**。
-      // 覆盖两种卡片：(a) 全部问题都无 options；(b) 混合题型（部分有选项、部分是自由文本）。
-      // 此前只处理 (a)，于是混合题型的文字会落进派活、提问永久挂着，
-      // 而回调文案还写着「请直接回复文字」——提示与行为矛盾（round-5 发现 1）。
+      const optionQs = pendingQ.questions
+        .map((q, qi) => ((q.options ?? []).length ? qi : -1))
+        .filter((qi) => qi >= 0);
       const textQs = pendingQ.questions
         .map((q, qi) => ((q.options ?? []).length ? -1 : qi))
         .filter((qi) => qi >= 0);
-      const hasUnfilledText = textQs.some((qi) => !pendingQ.draftCustom.has(qi));
-      if (textQs.length > 0 && hasUnfilledText && !parseCommand(t)) {
+      const unfilledText = textQs.some((qi) => !pendingQ.draftCustom.has(qi));
+
+      if (isSkip) {
+        await this.commandAnswer(msg, [pendingQ.id, t]);
+        return;
+      }
+      // 回数字：只有当卡片**确实有待选项**时才算选项作答；
+      // 纯文字题卡片回数字应作为文字答案（round-6 P2：数字文本此前答不进去）。
+      if (isChoice && optionQs.length > 0) {
+        await this.commandAnswer(msg, [pendingQ.id, t]);
+        return;
+      }
+      // 纯文字题卡片：普通文字自动当答案（整张卡片就是一份问卷，无歧义）。
+      // 注意**不要**排除数字：纯文字题卡片没有可选项，`123` 只能是文字
+      // （round-6 P2：此前数字文本答不进去）。
+      const pureTextCard = textQs.length > 0 && optionQs.length === 0;
+      if (pureTextCard && unfilledText && !parseCommand(t)) {
         const r = this.userQuestions.answerText(String(pendingQ.id), t, { platform, chatId });
-        const texts = {
-          answered: `✅ 已回答提问 #${pendingQ.id} 的第 ${(r.qi ?? 0) + 1} 题，agent 继续。`,
-          'not-found': `ℹ️ 提问 #${pendingQ.id} 不存在、已回答或已超时。`,
-          forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
-          invalid: '⚠️ 该题已答或不是自由文本题，请按卡片编号回复。',
-        };
         await this.send({ platform, chatId }, {
           text: r.status === 'partial'
             ? `📝 已记录提问 #${pendingQ.id} 第 ${(r.qi ?? 0) + 1} 题的文字；还有 ${r.remainingText} 道文字题未答。`
-            : (texts[r.status] ?? `ℹ️ ${r.status}`),
+            : `✅ 已回答提问 #${pendingQ.id}，agent 继续。`,
         });
         return;
       }
@@ -1021,6 +1037,9 @@ export class ImRuntime extends Service {
         empty: `ℹ️ 提问 #${id} 还没有任何选择——请先按编号或点按钮选择。`,
         'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
         forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+        continued: `✅ 已提交提问 #${id} 的当前选择（此前已超时挂起，答案已转交 agent）。`,
+        'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案——请让 agent 重新提问。',
+        'delivery-error': '⚠️ 答案转交失败（不是你的格式问题），请稍后重试。',
       };
       return this.send(chat, { text: t[r] ?? `ℹ️ ${r}` });
     }
@@ -1034,8 +1053,34 @@ export class ImRuntime extends Service {
         forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
         continued: `⏭️ 已跳过提问 #${id}（此前已超时挂起，答案已转交 agent）。`,
         'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案。',
+        'delivery-error': '⚠️ 答案转交失败（不是你操作的问题），请稍后重试。',
       };
       return this.send(chat, { text: t[r] ?? `ℹ️ ${r}` });
+    }
+
+    // 自由文本作答：`/answer <id> text <内容>`。
+    // 混合题型（部分有选项、部分是自由文本）必须走这条**显式**路径 ——
+    // 入站普通文字不再被自动吞成答案（那会丢掉用户想派的新任务，round-6 发现）。
+    const textMatch = String(picksRaw).match(/^text$/i);
+    if (textMatch) {
+      const content = customParts.join(' ').trim();
+      if (!content) {
+        return this.send(chat, { text: `用法：/answer ${id} text <内容>` });
+      }
+      const r = this.userQuestions.answerText(String(id), content, { platform: msg.platform, chatId: msg.chatId });
+      const t = {
+        answered: `✅ 已回答提问 #${id} 的文字题，agent 继续。`,
+        partial: `📝 已记录提问 #${id} 第 ${(r.qi ?? 0) + 1} 题的文字；还有 ${r.remainingText} 道文字题未答。`,
+        continued: `✅ 已回答提问 #${id}（此前已超时挂起，答案已转交 agent）。`,
+        invalid: r.reason === 'no-text-question'
+          ? '⚠️ 该提问没有自由文本题，请用编号作答。'
+          : '⚠️ 该提问的文字题都已作答。',
+        forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+        'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
+        'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案——请让 agent 重新提问。',
+        'delivery-error': '⚠️ 答案转交失败（不是你的格式问题），请稍后重试。',
+      };
+      return this.send(chat, { text: t[r.status] ?? `ℹ️ ${r.status}` });
     }
 
     const multi = rec.questions.length > 1;
@@ -1064,12 +1109,16 @@ export class ImRuntime extends Service {
     const texts = {
       answered: `✅ 已回答提问 #${id}，agent 继续。`,
       'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
-      invalid: isContinued
-        ? '⚠️ 编号无效（该提问此前已超时挂起，请按原卡片编号重发）。'
-        : '⚠️ 编号越界，提问仍在等待——请按卡片编号重发。',
+      invalid: rec.questions.some((q) => !(q.options ?? []).length)
+        // 卡片含自由文本题：文字题必须用显式语法，编号只能答选项题
+        ? `⚠️ 还没答完——该卡片含**自由文本题**，请用 \`/answer ${id} text <内容>\` 回答文字题，或发 \`/answer ${id} done\` 提交当前选择。`
+        : (isContinued
+          ? '⚠️ 编号无效（该提问此前已超时挂起，请按原卡片编号重发）。'
+          : '⚠️ 编号越界，提问仍在等待——请按卡片编号重发。'),
       forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
       continued: `✅ 已回答提问 #${id}（此前已超时挂起，答案已转交 agent）。`,
       'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案——请让 agent 重新提问。',
+      'delivery-error': '⚠️ 答案转交失败（不是你的格式问题），请稍后重试。',
     };
     await this.send(chat, { text: texts[result] ?? `ℹ️ ${result}` });
   }

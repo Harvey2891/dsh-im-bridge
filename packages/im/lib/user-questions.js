@@ -269,17 +269,24 @@ export class UserQuestionAnswerer {
       if (opts.length === 0) lines.push('  （无预设选项，请直接回复文字）');
     });
 
+    const hasOptions = record.questions.some((q) => (q.options ?? []).length);
+    const hasText = record.questions.some((q) => !(q.options ?? []).length);
+    const mixed = hasOptions && hasText;
     lines.push(
       '',
-      `回复方式：**直接回数字**即可（如 \`2\`；多选逗号分隔，如 \`1,3\`）`
-      + `，也可发 \`/answer ${record.id} 2\`。`,
+      hasOptions
+        ? `选项题：**直接回数字**即可（如 \`2\`；多选逗号分隔，如 \`1,3\`），或发 \`/answer ${record.id} 2\`。`
+        : '',
+      hasText
+        ? (mixed
+          // 混合题型：普通文字**不会**被自动当作答案（否则会吞掉你本想派的新任务），
+          // 因此必须用显式语法 —— 卡片必须写清楚，不能只说"直接回复文字"
+          ? `文字题：发 \`/answer ${record.id} text <内容>\`（混合题型下普通文字按新任务处理，不会被当作答案）。`
+          : '文字题：**直接回复文字**即可（本卡片全部是文字题）。')
+        : '',
       `不想选：回 \`skip\`（或 \`/answer ${record.id} skip\`），agent 会自行决定后继续。`,
       record.questions.length > 1
         ? `按钮可逐题点选：答全会自动提交；也可发 \`/answer ${record.id} done\` 提前提交（未答的题按跳过）。`
-        : '',
-      // 自由文本题（无选项）必须明确告诉用户「直接回文字」是有效的
-      record.questions.some((q) => !(q.options ?? []).length)
-        ? '自由文本题：**直接回复文字**即可（自动填入尚未作答的那道文字题）。'
         : '',
     );
 
@@ -297,26 +304,15 @@ export class UserQuestionAnswerer {
    * @returns {'skipped'|'not-found'|'forbidden'}
    */
   skip(questionId, from) {
-    const rec = this.records.get(questionId);
-    if (!rec) {
-      // 已挂起可续答：skip 同样经继续协议送回空答案
-      const cont = this.continued.get(questionId);
-      if (!cont) return 'not-found';
-      if (from && !this._owns(cont, from)) return 'forbidden';
-      const answers = cont.questions.map((q) => ({ id: q.id, selected: [] }));
-      const delivered = this.deliverContinued(cont, answers);
-      if (delivered === 'delivered') { this.continued.delete(questionId); return 'continued'; }
-      return delivered === 'unavailable' ? 'no-continuation' : 'invalid';
-    }
-    if (rec.state !== STATE.WAITING) return 'not-found';
+    const rec = this._find(questionId);
+    if (!rec) return 'not-found';
     if (from && !this._owns(rec, from)) return 'forbidden';
-    this._settle(
-      questionId,
-      STATE.ANSWERED,
-      { answers: rec.questions.map((q) => ({ id: q.id, selected: [] })) },
+    const r = this._finish(
+      rec,
+      rec.questions.map((q) => ({ id: q.id, selected: [] })),
       { skipped: true },
     );
-    return 'skipped';
+    return r === 'answered' ? 'skipped' : r;
   }
 
   /**
@@ -332,32 +328,19 @@ export class UserQuestionAnswerer {
    * @returns {'answered'|'not-found'|'invalid'|'forbidden'}
    */
   respond(questionId, picks, custom, from, opts = {}) {
-    const rec = this.records.get(questionId);
-    if (!rec) {
-      // 已挂起但可续答（timed 前台超时后）：转为经 DSH 继续协议送回
-      const cont = this.continued.get(questionId);
-      if (!cont) return 'not-found';
-      if (from && !this._owns(cont, from)) return 'forbidden';
-      const built = this._buildAnswers(cont, picks, custom, opts);
-      if (!built.ok) return 'invalid';
-      const delivered = this.deliverContinued(cont, built.answers);
-      if (delivered === 'delivered') {
-        this.continued.delete(questionId);
-        return 'continued';
-      }
-      return delivered === 'unavailable' ? 'no-continuation' : 'invalid';
-    }
-    if (rec.state !== STATE.WAITING) return 'not-found';
+    const rec = this._find(questionId);
+    if (!rec) return 'not-found';
     // 归属校验：只有提问所在会话才能作答（否则另一个聊天里的授权用户可跨会话代答）
     if (from && !this._owns(rec, from)) return 'forbidden';
-    const built = this._buildAnswers(rec, picks, custom, opts);
-    if (!built.ok) return 'invalid';
-    const unanswered = built.answers.filter((a) => a.selected.length === 0).length;
-
-    this._settle(questionId, STATE.ANSWERED, { answers: built.answers }, {
+    const err = this._merge(rec, { picks, text: custom });
+    if (err) return err;
+    // 文字命令路径要求答全（用户能明确表达"哪些题不选"）；按钮路径（accumulate）才允许部分
+    if (!opts.allowPartial && !this._isComplete(rec)) return 'invalid';
+    const answers = this._answersFromDraft(rec);
+    const unanswered = answers.filter((a) => a.selected.length === 0 && !a.custom).length;
+    return this._finish(rec, answers, {
       picks: picks.length, custom: !!custom, ...(unanswered ? { unanswered } : {}),
     });
-    return 'answered';
   }
 
   /**
@@ -371,53 +354,30 @@ export class UserQuestionAnswerer {
    * @returns {{status:string, answered?:number, total?:number, label?:string}}
    */
   accumulate(questionId, picks, from) {
-    const rec = this.records.get(questionId);
-    if (!rec || rec.state !== STATE.WAITING) return { status: 'not-found' };
+    const rec = this._find(questionId);
+    if (!rec) return { status: 'not-found' };
     if (from && !this._owns(rec, from)) return { status: 'forbidden' };
+    const err = this._merge(rec, { picks });
+    if (err) return { status: err };
 
-    for (const p of picks) {
-      if (!Number.isInteger(p.qIndex) || p.qIndex < 0 || p.qIndex >= rec.questions.length) {
-        return { status: 'invalid' };
-      }
-      const opts = rec.questions[p.qIndex].options ?? [];
-      if (!Number.isInteger(p.oIndex) || p.oIndex < 0 || p.oIndex >= opts.length) {
-        return { status: 'invalid' };
-      }
-      if (!rec.questions[p.qIndex].multiSelect) rec.draft.set(p.qIndex, []);
-      if (!rec.draft.has(p.qIndex)) rec.draft.set(p.qIndex, []);
-      const label = opts[p.oIndex].label;
-      if (!rec.draft.get(p.qIndex).includes(label)) rec.draft.get(p.qIndex).push(label);
-    }
-
-    const withOptions = rec.questions
-      .map((q, qi) => ((q.options ?? []).length ? qi : -1))
-      .filter((qi) => qi >= 0);
-    const textQs = rec.questions
-      .map((q, qi) => ((q.options ?? []).length ? -1 : qi))
-      .filter((qi) => qi >= 0);
-    const answered = withOptions.filter((qi) => rec.draft.has(qi)).length;
-
-    // 🔴 含**自由文本题**（无 options）时不能由按钮单独结题：
-    // 那种题按钮无法作答，自动结题会把它的答案伪造为空
-    // （round-4 发现 1）。必须等用户回文字（answerText）把文字题也填上，或显式 done/skip。
+    const optionQs = this._optionQs(rec);
+    const answered = optionQs.filter((qi) => rec.draft.has(qi)).length;
     const lastQ = picks.length ? picks[picks.length - 1].qIndex : 0;
     const label = rec.draft.get(lastQ)?.join('、') ?? '';
-    const complete = answered >= withOptions.length
-      && textQs.every((qi) => rec.draftCustom.has(qi));
 
-    if (complete) {
-      this._settle(questionId, STATE.ANSWERED, { answers: this._answersFromDraft(rec) }, { accumulated: true });
-      return { status: 'answered', answered, total: rec.questions.length, label };
+    if (this._isComplete(rec)) {
+      const r = this._finish(rec, this._answersFromDraft(rec), { accumulated: true });
+      return { status: r, answered, total: rec.questions.length, label };
     }
-    // 未答全：保持等待，回报进度
-    this.logLine(`question #${questionId} partial ${answered}/${withOptions.length} (${label})`);
+    // 未答全：保持等待，回报进度（不是结题）
+    this.logLine(`question #${rec.id} partial ${answered}/${optionQs.length} (${label})`);
     return {
       status: 'partial',
       answered,
       total: rec.questions.length,
       label,
-      // 还有自由文本题没填 → 提示用户直接回文字
-      needsText: textQs.some((qi) => !rec.draftCustom.has(qi)),
+      // 还有自由文本题没填 → 提示用户用显式语法作答
+      needsText: this._textQs(rec).some((qi) => !rec.draftCustom.has(qi)),
     };
   }
 
@@ -430,30 +390,24 @@ export class UserQuestionAnswerer {
    * @returns {{status:string, qi?:number, remainingText?:number}}
    */
   answerText(questionId, text, from) {
-    const rec = this.records.get(questionId);
-    if (!rec || rec.state !== STATE.WAITING) return { status: 'not-found' };
+    const rec = this._find(questionId);
+    if (!rec) return { status: 'not-found' };
     if (from && !this._owns(rec, from)) return { status: 'forbidden' };
-    const t = String(text ?? '').trim();
-    if (!t) return { status: 'invalid' };
-
-    const textQs = rec.questions
-      .map((q, qi) => ((q.options ?? []).length ? -1 : qi))
-      .filter((qi) => qi >= 0);
-    if (textQs.length === 0) return { status: 'invalid' };
+    const textQs = this._textQs(rec);
     const target = textQs.find((qi) => !rec.draftCustom.has(qi));
-    if (target === undefined) return { status: 'invalid' };
-    rec.draftCustom.set(target, t);
-
-    const withOptions = rec.questions
-      .map((q, qi) => ((q.options ?? []).length ? qi : -1))
-      .filter((qi) => qi >= 0);
-    const answered = withOptions.filter((qi) => rec.draft.has(qi)).length;
-    const remainingText = textQs.filter((qi) => !rec.draftCustom.has(qi)).length;
-    if (answered >= withOptions.length && remainingText === 0) {
-      this._settle(questionId, STATE.ANSWERED, { answers: this._answersFromDraft(rec) }, { text: true });
-      return { status: 'answered', qi: target, remainingText: 0 };
+    if (target === undefined) {
+      // 没有文字题，或文字题都已作答
+      return { status: 'invalid', reason: textQs.length === 0 ? 'no-text-question' : 'text-already-answered' };
     }
-    this.logLine(`question #${questionId} text-filled q${target + 1}, remaining text=${remainingText}`);
+    const err = this._merge(rec, { text });
+    if (err) return { status: err };
+
+    const remainingText = this._textQs(rec).filter((qi) => !rec.draftCustom.has(qi)).length;
+    if (this._isComplete(rec)) {
+      const r = this._finish(rec, this._answersFromDraft(rec), { text: true });
+      return { status: r, qi: target, remainingText: 0 };
+    }
+    this.logLine(`question #${rec.id} text-filled q${target + 1}, remaining text=${remainingText}`);
     return { status: 'partial', qi: target, remainingText };
   }
 
@@ -471,69 +425,103 @@ export class UserQuestionAnswerer {
    * @returns {'answered'|'not-found'|'forbidden'|'empty'}
    */
   commitDraft(questionId, from) {
-    const rec = this.records.get(questionId);
-    if (!rec) {
-      // 🔴 continued 状态也要能提交：否则"先累计一部分 → timed 超时 → 发 done"
-      // 会返回 not-found，草稿白丢（round-5 发现 2）。
-      const cont = this.continued.get(questionId);
-      if (!cont) return 'not-found';
-      if (from && !this._owns(cont, from)) return 'forbidden';
-      if (cont.draft.size === 0 && cont.draftCustom.size === 0) return 'empty';
-      const delivered = this.deliverContinued(cont, this._answersFromDraft(cont));
-      if (delivered === 'delivered') { this.continued.delete(questionId); return 'continued'; }
-      return delivered === 'unavailable' ? 'no-continuation' : 'invalid';
-    }
-    if (rec.state !== STATE.WAITING) return 'not-found';
+    const rec = this._find(questionId);
+    if (!rec) return 'not-found';
     if (from && !this._owns(rec, from)) return 'forbidden';
     if (rec.draft.size === 0 && rec.draftCustom.size === 0) return 'empty';
-    this._settle(questionId, STATE.ANSWERED, { answers: this._answersFromDraft(rec) }, { committed: true });
-    return 'answered';
+    return this._finish(rec, this._answersFromDraft(rec), { committed: true });
+  }
+
+  // ── 统一作答内核（覆盖 WAITING 与 CONTINUED 两种状态） ────────────────────
+  //
+  // 设计（round-6 重构）：此前「累计 / 文字 / 提交 / 跳过」各自实现一遍，于是
+  // continued 状态被反复漏掉、命令路径与入站路径口径不一致。现在全部收敛到
+  // `_find` → `_merge` → `_isComplete` → `_finish` 四个原语，
+  // 任何入口都自动同时支持「等待中」与「已挂起可续答」。
+
+  /** 取记录：等待中或已挂起可续答（continued）。 */
+  _find(id) {
+    return this.records.get(id) ?? this.continued.get(id) ?? null;
+  }
+
+  /** 有选项的题下标。 */
+  _optionQs(rec) {
+    return rec.questions.map((q, qi) => ((q.options ?? []).length ? qi : -1)).filter((qi) => qi >= 0);
+  }
+
+  /** 无选项（自由文本）的题下标。 */
+  _textQs(rec) {
+    return rec.questions.map((q, qi) => ((q.options ?? []).length ? -1 : qi)).filter((qi) => qi >= 0);
   }
 
   /**
-   * 校验并组装答案（不结算）。越界编号**不得**静默丢弃后照样结题——那会把
-   * 「答错了」变成「已作答但空选择」，用户以为选上了、agent 却什么都没拿到。
-   * @returns {{ok:true, answers:Array}|{ok:false, reason:string}}
+   * 把本次作答合并进草稿（**不结算**）。
+   * - 选项：单选**替换**该题已选，多选累加；越界返回 `invalid`
+   * - 文字：填入**第一道尚未作答的自由文本题**；若整张卡片没有文字题，
+   *   则把文字作为附言挂到**第一个已选中的题**上（保持 `/answer <id> 2 附言` 的旧语义）
+   * @returns {string|null} 错误码；null 表示已合并
    */
-  _buildAnswers(rec, picks, custom, opts = {}) {
-    // 无选项的问题：允许纯文字作答（见 renderCard 的「请直接回复文字」提示）
-    const noOptions = rec.questions.every((q) => !(q.options ?? []).length);
-    if (picks.length === 0 && !(custom && noOptions)) return { ok: false, reason: 'no-picks' };
-
-    const byQ = new Map();
+  _merge(rec, { picks = [], text } = {}) {
+    // 单选题目在同一次调用里给了多个选择 → 拒绝（`/answer 01 1,2` 应报错，
+    // 不能静默"最后一个生效"）。按钮路径每次只带一个 pick，不受影响。
+    const perQ = new Map();
+    for (const p of picks) perQ.set(p.qIndex, (perQ.get(p.qIndex) ?? 0) + 1);
+    for (const [qi, n] of perQ) {
+      if (n > 1 && !rec.questions[qi]?.multiSelect) return 'invalid';
+    }
     for (const p of picks) {
-      if (!Number.isInteger(p.qIndex) || p.qIndex < 0 || p.qIndex >= rec.questions.length) {
-        return { ok: false, reason: 'qIndex-out-of-range' };
-      }
-      const opts_ = rec.questions[p.qIndex].options ?? [];
-      if (!Number.isInteger(p.oIndex) || p.oIndex < 0 || p.oIndex >= opts_.length) {
-        return { ok: false, reason: 'oIndex-out-of-range' };
-      }
-      if (!byQ.has(p.qIndex)) byQ.set(p.qIndex, []);
-      const label = opts_[p.oIndex].label;
-      if (!byQ.get(p.qIndex).includes(label)) byQ.get(p.qIndex).push(label);
+      if (!Number.isInteger(p.qIndex) || p.qIndex < 0 || p.qIndex >= rec.questions.length) return 'invalid';
+      const opts = rec.questions[p.qIndex].options ?? [];
+      if (!Number.isInteger(p.oIndex) || p.oIndex < 0 || p.oIndex >= opts.length) return 'invalid';
+      if (!rec.questions[p.qIndex].multiSelect) rec.draft.set(p.qIndex, []);
+      if (!rec.draft.has(p.qIndex)) rec.draft.set(p.qIndex, []);
+      const label = opts[p.oIndex].label;
+      if (!rec.draft.get(p.qIndex).includes(label)) rec.draft.get(p.qIndex).push(label);
     }
-    // 单问题必须给出一个选择；多问题在文字路径下要求答全，按钮路径允许部分
-    if (!opts.allowPartial) {
-      for (let qi = 0; qi < rec.questions.length; qi++) {
-        if ((rec.questions[qi].options ?? []).length && !byQ.has(qi)) {
-          return { ok: false, reason: 'unanswered' };
-        }
-      }
-    }
-    for (const [qi, labels] of byQ) {
-      if (!rec.questions[qi].multiSelect && labels.length > 1) {
-        return { ok: false, reason: 'multi-select-on-single' };
+    if (text != null) {
+      const t = String(text).trim();
+      if (!t) return 'invalid';
+      const textQs = this._textQs(rec);
+      if (textQs.length > 0) {
+        const target = textQs.find((qi) => !rec.draftCustom.has(qi));
+        if (target === undefined) return 'invalid';
+        rec.draftCustom.set(target, t);
+      } else {
+        const target = [...rec.draft.keys()].sort((a, b) => a - b)[0];
+        if (target === undefined) return 'invalid';
+        rec.draftCustom.set(target, t);
       }
     }
-    return {
-      ok: true,
-      answers: rec.questions.map((q, qi) => {
-        const item = { id: q.id, selected: byQ.get(qi) ?? [] };
-        if (custom && qi === 0) item.custom = custom;
-        return item;
-      }),
-    };
+    return null;
+  }
+
+  /** 草稿是否已答全：有选项的题都有选择，自由文本题都有文字。 */
+  _isComplete(rec) {
+    return rec.questions.every((q, qi) => (
+      (q.options ?? []).length ? rec.draft.has(qi) : rec.draftCustom.has(qi)
+    ));
+  }
+
+  /**
+   * 统一收尾：**等待中 → 结算**；**已挂起可续答 → 经 DSH 继续协议投递**。
+   *
+   * 继续协议要求答案批「每题恰好一次」（DSH `index.ts:178-185` 否则抛 BAD_ANSWER），
+   * 而 `_answersFromDraft` 恒按 `rec.questions` 生成等长数组，满足该约束。
+   * @returns {'answered'|'continued'|'no-continuation'|'delivery-error'}
+   */
+  _finish(rec, answers, extra) {
+    if (rec.state !== STATE.CONTINUED) {
+      this._settle(rec.id, STATE.ANSWERED, { answers }, extra);
+      return 'answered';
+    }
+    const delivered = this.deliverContinued(rec, answers);
+    if (delivered === 'delivered') {
+      this.continued.delete(rec.id);
+      return 'continued';
+    }
+    // 区分「本机没有继续服务」与「投递出错」——后者不是用户答案格式问题，
+    // 统一报 invalid 会误导用户（round-6 P3）
+    return delivered === 'unavailable' ? 'no-continuation' : 'delivery-error';
   }
 
   /** 该记录是否属于给定会话。 */
