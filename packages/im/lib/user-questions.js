@@ -288,9 +288,12 @@ export class UserQuestionAnswerer {
       // 🔴 多选判定必须**优先于**多题分支（新计轮 round-2 P2-1）：多题卡里只要有一题
       // multiSelect，统一结题门（_mayAutoSettle）就禁止自动提交——旧版多题分支无条件
       // 写"答全会自动提交"，对含多选的卡是错误承诺：用户答完会停在 partial（操作无效）。
-      record.questions.some((q) => q.multiSelect)
+      // 🔴 两处口径与结题门一致（新计轮 round-3）：① 判定用 `=== true`（同 _hasMultiSelect）；
+      // ② 多题示例必须用"题号.选项号"——多题解析下裸 `1,3` 全部映射到第 1 题
+      // （index.js commandAnswer），第 1 题单选时照抄示例会返回 invalid。
+      record.questions.some((q) => q.multiSelect === true)
         ? (record.questions.length > 1
-          ? `本卡含**多选题**：按钮可逐题点选，但选完**不会自动提交**——请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔，如 \`1,3\`）。`
+          ? `本卡含**多选题**：按钮可逐题点选，但选完**不会自动提交**——请发 \`/answer ${record.id} done\` 提交（多选题编号用"题号.选项号"，如 \`2.1,2.3\`）。`
           : `本卡含**多选题**：**不会自动提交**——选完请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔，如 \`1,3\`）。`)
         : record.questions.length > 1
           ? `按钮可逐题点选：答全会自动提交；也可发 \`/answer ${record.id} done\` 提前提交（未答的题按跳过）。`

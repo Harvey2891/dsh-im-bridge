@@ -1135,6 +1135,65 @@ test('回归：autoCreate 首条消息 agent 创建失败 → 回滚绑定 + 回
   }
 });
 
+test('回归：并发替换后 dispatchTask 失败回滚不得误删他人绑定（round-3 P2 身份校验）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    const origCreateAgent = im.createAgent.bind(im);
+    im.createAgent = async () => {
+      // 模拟并发 /new：createAgent 的 await 期间绑定被替换成别的会话
+      im.map.remove('mock', 'chat-1');
+      im.map.create('mock', 'chat-1', { chatType: 'private', sessionId: 'im-mock-concurrent' });
+      throw new Error('boom: simulated agent init failure');
+    };
+    try {
+      await mock.sendFromUser({ text: '跑一个任务' });
+    } finally {
+      im.createAgent = origCreateAgent;
+    }
+
+    // 🔴 旧版按 key 盲删：会把并发 /new 刚建的绑定删掉（运行中的 agent 失去映射）。
+    // 现在回滚带身份校验（sessionId 匹配才删）。
+    assert.equal(
+      im.map.get('mock', 'chat-1')?.sessionId,
+      'im-mock-concurrent',
+      '失败回滚不得误删并发替换进来的绑定（身份校验）',
+    );
+    assert.ok(mock.sent.some((m) => m.text?.includes('会话创建失败')), '仍应发失败回执');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：并发替换后 /new 失败回滚不得误删他人绑定（round-3 P2 身份校验）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('任务完成')), { label: 'result card', timeoutMs: 8000 });
+
+    const origCreateAgent = im.createAgent.bind(im);
+    im.createAgent = async () => {
+      // 模拟并发消息：/new 新绑定创建后、createAgent 期间被替换
+      im.map.remove('mock', 'chat-1');
+      im.map.create('mock', 'chat-1', { chatType: 'private', sessionId: 'im-mock-concurrent2' });
+      throw new Error('boom: simulated agent init failure');
+    };
+    try {
+      await im.commandNew({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' });
+    } finally {
+      im.createAgent = origCreateAgent;
+    }
+
+    assert.equal(
+      im.map.get('mock', 'chat-1')?.sessionId,
+      'im-mock-concurrent2',
+      '/new 失败回滚不得误删并发替换进来的绑定（身份校验）',
+    );
+    assert.ok(mock.sent.some((m) => m.text?.includes('新会话创建失败')), '仍应发失败回执');
+  } finally {
+    await teardown();
+  }
+});
+
 test('回归：/log 宣布段数 = 实际段数，无二次切分（round-2 P2-5）', async () => {
   const { mock, im, teardown } = await setup(QSCRIPT);
   try {

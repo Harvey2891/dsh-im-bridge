@@ -435,6 +435,9 @@ test('回归：多题卡含多选不得承诺"答全自动提交"（round-2 P2-1
   assert.ok(!card.text.includes('答全会自动提交'), '含多选的多题卡不得承诺"答全会自动提交"');
   assert.ok(card.text.includes('不会自动提交'), '应明确"不会自动提交"');
   assert.ok(card.text.includes('/answer'), '应给出 done 提交命令');
+  // 🔴 多题示例必须用"题号.选项号"（round-3 P2）：裸 `1,3` 在多题解析下
+  // 全部映射到第 1 题，第 1 题单选时照抄示例会返回 invalid。
+  assert.ok(card.text.includes('2.1,2.3'), '多题多选的编号示例必须是点号格式（如 2.1,2.3）');
 });
 
 test('回归：无多选的多题卡保留"答全自动提交"口径（round-2 P2-1 负向对照）', async () => {

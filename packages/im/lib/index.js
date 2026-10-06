@@ -683,7 +683,7 @@ export class ImRuntime extends Service {
     // 🔴 本条消息是否**新建**了绑定（新计轮 round-2 P2-2）：agent 创建失败时只有
     // "本次新建"的绑定才回滚（不留僵尸会话）；既有会话失败必须**保留**绑定——
     // 下次消息还能重试恢复/创建，只发失败回执。
-    const createdHere = !binding;
+    let createdHere = !binding;
 
     // 新聊天默认不自动建 session（FR-2.3）
     if (!binding) {
@@ -699,7 +699,16 @@ export class ImRuntime extends Service {
         });
         return;
       }
-      binding = this.createBinding(platform, chatId, msg.chatType ?? 'private');
+      // 🔴 创建前同步复核（新计轮 round-3）：并发 /new 可能已抢先建好绑定——
+      // map.create 幂等，会把**别人的**绑定对象交给我们，此时失败不得回滚。
+      // （复核与 createBinding 之间无 await，同步代码不可交错，判定可靠。）
+      const prior = this.map.get(platform, chatId);
+      if (prior) {
+        binding = prior;
+        createdHere = false; // 并发先建：接管，不认领
+      } else {
+        binding = this.createBinding(platform, chatId, msg.chatType ?? 'private');
+      }
     }
 
     this.map.touch(platform, chatId, userId, userName);
@@ -745,7 +754,14 @@ export class ImRuntime extends Service {
       // round-2 P2-2：autoCreate 首条消息的 /new-P2-4 同类路径）。
       // 只回滚"本次新建"的绑定；既有会话保留绑定（下次消息可重试恢复/创建）。
       this.log.error('im: 会话 agent 创建/恢复失败 | session=%s | %s', binding.sessionId, err?.message ?? err);
-      if (createdHere) this.map.remove(platform, chatId);
+      // 🔴 回滚双保险（新计轮 round-3）：① createdHere=本次认领创建；② 身份校验——
+      // createAgent 的 await 期间并发 /new 可能已替换绑定，按 key 盲删会误删
+      // 别人的绑定（运行中的 agent 失去映射）。只删"当前条目仍是我建的"。
+      const cur = this.map.get(platform, chatId);
+      if (createdHere && cur?.sessionId === binding.sessionId) {
+        this.map.remove(platform, chatId);
+        await this.map.save(); // 立即持久化回滚（500ms 防抖保存可能赶不上进程退出，P3-4）
+      }
       await this.send({ platform, chatId }, {
         text: createdHere
           ? '❌ 会话创建失败（agent 初始化失败），任务未执行。请再发一次本条消息重试。'
@@ -1022,9 +1038,16 @@ export class ImRuntime extends Service {
     } catch (err) {
       // 🔴 agent 创建失败 → 回滚绑定（新计轮 round-1 P2）：否则留下"僵尸会话"——
       // 绑定已落盘但 agent 不存在，后续消息走已绑定路径拿不到 agent 而卡死，
-      // /new 也看到旧绑定。map.remove 自带 _scheduleSave 持久化。
+      // /new 也看到旧绑定。
+      // 🔴 身份校验（新计轮 round-3）：createAgent 的 await 期间并发消息可能已替换
+      // 绑定（map.create 幂等），按 key 盲删会误删别人的绑定。只回滚"当前条目
+      // 仍是我刚创建的"，并立即持久化（防抖保存可能赶不上进程退出，P3-4）。
       this.log.error(`im: /new agent 创建失败，已回滚绑定 | sessionId=${binding.sessionId} err=${err.message}`);
-      this.map.remove(platform, chatId);
+      const cur = this.map.get(platform, chatId);
+      if (cur?.sessionId === binding.sessionId) {
+        this.map.remove(platform, chatId);
+        await this.map.save();
+      }
       await this.send({ platform, chatId }, {
         text: `❌ 新会话创建失败（agent 初始化失败）。请再发一次 /new 重试。`,
       });
