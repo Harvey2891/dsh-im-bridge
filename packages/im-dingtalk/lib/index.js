@@ -18,6 +18,14 @@ const inject = ['im'];
 export const TOPIC_ROBOT = '/v1.0/im/bot/messages/get';
 export const TOPIC_CARD = '/v1.0/card/instances/callback';
 
+/**
+ * 单条 markdown 消息的字节预算（含代码围栏与标题）。与 channel.maxMessageBytes 一致。
+ * 🔴 必须是**模块作用域**常量：放进 apply() 内部时，一旦 apply 提前 return，
+ * 该 const 会停留在 TDZ，之后调用 sendFile 抛 `Cannot access before initialization`
+ * （实测踩过：/log 因此在无 webhook 场景外也整条失败）。
+ */
+const MAX_BYTES_FOR_CODE = 3000;
+
 const Config = z.object({
   clientId: z.string().default('env:DINGTALK_CLIENT_ID'),
   clientSecret: z.string().default('env:DINGTALK_CLIENT_SECRET'),
@@ -58,6 +66,12 @@ export function apply(ctx, config = {}, internals = {}) {
   const channel = {
     platform: 'dingtalk',
     displayName: '钉钉',
+    // 单条消息字节上限（保守值）。实测：6546 字节的 markdown 消息会在约 5600
+    // 字节处被钉钉截断，用户只看到「输出不完整」。核心据此按字节分段发送。
+    maxMessageBytes: 3000,
+    // 本渠道渲染不了内联按钮，会把 buttons 降级为正文命令。声明后核心在计算
+    // 字节预算时会把这段降级文本一并算进去（否则最终正文仍可能超限被截断）。
+    buttonsAsText: true,
     status: {
       connected: false,
       detail: clientId ? 'starting' : 'missing clientId (DINGTALK_CLIENT_ID)',
@@ -135,10 +149,17 @@ export function apply(ctx, config = {}, internals = {}) {
     // 心跳：任何事件都更新（连接活着 ≠ 事件在流）
     channel.status = { ...channel.status, connected: true, lastEventAt: Date.now() };
     try {
+      // 🔴 必须给这两个 Promise 接 `.catch`：外层 `try` 只能捕获**同步**抛错，
+      // `void somePromise` 的异步 rejection 会成为未处理拒绝（可能让进程告警/退出）。
+      // 核心 `_dispatch()` 现在会把投递失败转成异常，这条路径因此是可达的。
       if (topic === TOPIC_CARD) {
-        void handleCardCallback(downstream);
+        void handleCardCallback(downstream).catch((err) => {
+          logger.error('dsh-im-dingtalk: card callback failed | 卡片回调处理失败: %s', err?.message ?? err);
+        });
       } else {
-        void handleRobotMessage(downstream);
+        void handleRobotMessage(downstream).catch((err) => {
+          logger.error('dsh-im-dingtalk: robot message handling failed | 机器人消息处理失败: %s', err?.message ?? err);
+        });
       }
     } catch (err) {
       logger.warn('dsh-im-dingtalk: downstream handler failed | 事件处理失败: %s', err.message);
@@ -197,15 +218,24 @@ export function apply(ctx, config = {}, internals = {}) {
 
   async function send(out) {
     const chatId = out.chatId;
+    // 核心层会带上该会话已知的平台 userId（来自持久化会话映射）。
+    // 机器人主动推送必须用它，不能用 conversationId（会 staffId.notExisted）。
+    // 同时记进本适配器的内存映射，供后续同进程复用。
+    if (out.userId) chatUsers.set(chatId, out.userId);
     if (out.attachments?.length) {
       for (const att of out.attachments) {
         if (att.kind === 'file' && att.text != null) {
-          await sendFile(chatId, att.name ?? 'output.txt', att.text);
+          const r = await sendFile(chatId, att.name ?? 'output.txt', att.text);
+          // 附件投递失败必须上报，不能静默丢弃（round-2 发现 4）
+          if (r && r.failed) return r;
         }
       }
     }
-    if (!out.text) return {};
+    // 🔴 只有按钮、没有正文时不能直接 return：按钮在文本型渠道要靠正文呈现
+    // （核心已把命令拼进 text；若 buttons 仍在，这里降级成命令文本作为兜底）。
+    if (!out.text && !out.buttons?.length) return {};
     const text = withButtonsAsText(out);
+    if (!text) return {};
     const result = await deliver(chatId, text, out);
     return result ?? {};
   }
@@ -213,6 +243,11 @@ export function apply(ctx, config = {}, internals = {}) {
   /**
    * 出站投递：优先 sessionWebhook（会话内回复，最简单）；
    * 无 webhook 或已过期时降级为企业机器人主动推送（需 robotCode）。
+   *
+   * 注意：sessionWebhook 是**会话级短期凭证**（几十分钟即失效）。一旦过期，
+   * 回复只能走机器人主动推送——那条路径要求 userId。此前适配器只依赖入站学到的
+   * 内存映射，重启后即丢失，于是降级路径拿 conversationId 当 userId 被平台拒绝，
+   * 表现为「审批卡片、提问卡片都推不到 IM」且**没有明显报错**。
    */
   async function deliver(chatId, text, out) {
     const hook = sessionWebhooks.get(chatId);
@@ -224,52 +259,66 @@ export function apply(ctx, config = {}, internals = {}) {
       }
     }
     // 最终降级：机器人主动推送。失败必须带平台错误码可见（规则 #5），
-    // 且不得向上抛成未处理拒绝——出站失败由核心的记录/告警路径承担。
+    // 并把失败**上报**给核心（`{failed:true}`），由核心决定 fail-closed。
     try {
       return await sendViaRobotApi(chatId, text, out);
     } catch (err) {
-      logger.warn(
+      logger.error(
         'dsh-im-dingtalk: robot API send failed | 机器人推送失败: %s (code=%s)',
         err.message,
         err.code ?? 'n/a',
       );
-      return {};
+      return { failed: true, reason: err.code ?? 'robot-api-error', error: err.message };
     }
   }
 
+  /** 单条 markdown 消息的字节预算（含代码围栏与标题）。与 channel.maxMessageBytes 一致。 */
+  // 注：常量已提到模块作用域（见文件顶部 MAX_BYTES_FOR_CODE）——
+  // 放在 apply() 内部会在「apply 提前 return」时停留在 TDZ，
+  // 之后调用 sendFile 就会抛 `Cannot access before initialization`。
+
   /** 钉钉 sessionWebhook 请求体（markdown 以兼容换行与粗体）。 */
   function buildWebhookBody(text, out) {
-    const body = {
+    // 注意：text 已由 withButtonsAsText() 处理过按钮降级，这里**不能**再追加一次
+    // （否则同一份按钮文案会出现两遍）。
+    return {
       msgtype: 'markdown',
       markdown: { title: out.title ?? 'DeepSeek Harness', text },
     };
-    if (out.buttons?.length) {
-      // Webhook 消息不支持交互卡片；按钮降级为文本指令（钉钉无按钮时与企微/微信一致）
-      body.markdown.text += '\n\n' + buttonsAsCommands(out.buttons);
-    }
-    return body;
   }
 
   /** 企业机器人主动推送（oToMessages/batchSend）。
    *
    * ⚠️ 关键：`userIds` 必须传**钉钉 userId（senderStaffId）**，不能传 `conversationId`。
    * conversationId 是会话级不透明串，传给机器人 API 会得到 `staffId.notExisted`。
-   * 私聊时二者不同，因此入站时记下 chatId → userId 映射，出站时用它回推。
+   * userId 优先取核心层下传的 `out.userId`（来自持久化会话映射），
+   * 其次取本适配器入站学到的内存映射；两者都没有时**必须大声报错**——
+   * 这里曾静默失败，导致审批卡片与提问卡片都推不到钉钉且无从察觉。
    */
   async function sendViaRobotApi(chatId, text, out) {
     if (!robotCode) {
-      logger.warn(
-        'dsh-im-dingtalk: no sessionWebhook and no DINGTALK_ROBOT_CODE — cannot send | 无 sessionWebhook 且未配置 robotCode，无法发送',
+      logger.error(
+        'dsh-im-dingtalk: no sessionWebhook and no robotCode — cannot send | '
+        + '无 sessionWebhook 且未配置 robotCode，消息发不出去（检查 DINGTALK_ROBOT_CODE）',
       );
-      return {};
+      // 🔴 必须**上报失败**而不是返回空对象：核心据此决定是否 fail-closed。
+      // 若这里静默返回 {}，调用方（如提问/审批应答者）会以为送达成功，
+      // 于是记录一直停在 waiting —— 用户什么都没收到，agent 也永远等不到答案。
+      return { failed: true, reason: 'no-robotCode' };
     }
-    // 优先用入站学到的真实 userId；退化为 chatId（仅当 chatId 本身就是 userId 时才正确）
-    const targetUserId = chatUsers.get(chatId) ?? chatId;
-    if (!chatUsers.has(chatId)) {
-      logger.warn(
-        'dsh-im-dingtalk: no userId learned for chat %s; falling back to chatId as userId (may fail with staffId.notExisted) | 未学到该会话的 userId，回退用 chatId 作为 userId（可能报 staffId.notExisted）',
+    // 优先用核心下传的真实 userId（持久），退化到入站学到的内存映射
+    const targetUserId = out.userId ?? chatUsers.get(chatId);
+    if (!targetUserId || targetUserId === chatId) {
+      // conversationId 当 userId 必被平台拒绝；明确报错而不是发一条注定的失败请求
+      logger.error(
+        'dsh-im-dingtalk: no platform userId for chat %s — cannot push. '
+        + 'The sessionWebhook expired and chatId is a conversationId, not a userId. '
+        + 'Ask the user to send any message so the mapping is relearned. | '
+        + '该会话没有平台 userId，无法主动推送：sessionWebhook 已过期，而 chatId 是 conversationId。'
+        + '让用户随便发一条消息即可重新学到映射。',
         chatId,
       );
+      return { failed: true, reason: 'no-userId' };
     }
     const token = await getAccessToken();
     const body = {
@@ -290,25 +339,91 @@ export function apply(ctx, config = {}, internals = {}) {
     return { messageId: resp?.processQueryKey };
   }
 
-  /** 文件投递（/log 全量交付，FR-3.4）：钉钉需先上传媒体再发 file 消息。 */
+  /**
+   * 文件投递（/log 全量交付，FR-3.4）：钉钉 webhook 不支持直接 file 上传，
+   * 故以 markdown 代码块形式交付。
+   *
+   * 🔴 两条硬约束（round-2 发现 3、4）：
+   * 1. **不得改写正文**：`/log` 的语义是"取全文"，此前按字符截断、又把 ``` 替换成
+   *    `` ` ` ` ``，交付的已不是原文。现在正文逐字节原样送出；仅当正文**不含** ```
+   *    时才套代码围栏（避免围栏被正文闭合），含围栏时改用缩进式呈现。
+   * 2. **无投递路径必须上报失败**：没有 sessionWebhook 时此前静默 `return {}`，
+   *    调用方以为成功、用户却什么都没收到。
+   */
   async function sendFile(chatId, fileName, text, mime = 'text/plain') {
     const hook = sessionWebhooks.get(chatId);
+    if (!hook) {
+      logger.error(
+        'dsh-im-dingtalk: sendFile has no delivery path (no sessionWebhook) | '
+        + '无 sessionWebhook，文件/全文无法投递（请让用户先发一条消息以刷新 webhook）',
+      );
+      return { failed: true, reason: 'no-delivery-path' };
+    }
     try {
-      // 简化路径：以 markdown 代码块形式交付；钉钉 webhook 不支持直接 file 上传
-      if (hook) {
+      const raw = String(text ?? '');
+      const header = `📎 ${fileName}`;
+      const headerBytes = Buffer.byteLength(header, 'utf8');
+      // 序号 ` (i/n)\n\n` 的字节数 = 1+1+d_i+1+d_n+1 + 2（换行） = d_i+d_n+6，
+      // 最坏取同位数 2d+6。固定 8 字节在 10 段以上就不够（round-4 发现 2）。
+      let reserve = 8;
+      const splitWith = (r) => splitByBytesLossless(raw, Math.max(1, MAX_BYTES_FOR_CODE - headerBytes - r));
+      let parts = splitWith(reserve);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const need = String(parts.length).length * 2 + 6;
+        if (need <= reserve) break;
+        reserve = need;
+        parts = splitWith(reserve);
+      }
+      for (let i = 0; i < parts.length; i++) {
+        const seq = parts.length > 1 ? ` (${i + 1}/${parts.length})` : '';
+        // 🔴 用 `msgtype: 'text'` 而不是 markdown：/log 的语义是"取全文"，
+        // 既要**逐字节保真**（不能改写 ``` 或加缩进），又要**可读**。
+        // markdown 会解析正文里的 ``` / 链接 / 表格，既可能被正文自身闭合导致
+        // 渲染错乱，也会让原文在视觉上被改写；纯 text 不做任何解析，
+        // 两个目标同时满足（round-3 发现）。
         await postJson(hook.url, {
-          msgtype: 'markdown',
-          markdown: {
-            title: fileName,
-            text: `**📎 ${fileName}**\n\n\`\`\`\n${truncate(text, 4000)}\n\`\`\``,
-          },
+          msgtype: 'text',
+          text: { content: `${header}${seq}\n\n${parts[i]}` },
         });
       }
       return {};
     } catch (err) {
-      logger.warn('dsh-im-dingtalk: sendFile failed | 文件发送失败: %s', err.message);
-      return {};
+      logger.error('dsh-im-dingtalk: sendFile failed | 文件发送失败: %s', err.message);
+      return { failed: true, reason: 'sendFile-error', error: err.message };
     }
+  }
+
+  /**
+   * 按 UTF-8 字节切分且**逐字节无损**（`parts.join('') === text`）。
+   * 与核心 `renderer.splitByBytes` 同语义；适配器不依赖核心包，故本地实现一份。
+   * 行尾 `\n` 归属该行，保证拼接可还原。
+   */
+  function splitByBytesLossless(text, maxBytes) {
+    const s = String(text ?? '');
+    if (!s) return [];
+    const limit = Math.max(1, maxBytes);
+    if (Buffer.byteLength(s, 'utf8') <= limit) return [s];
+    const parts = [];
+    let cur = '';
+    let curBytes = 0;
+    for (const line of s.split(/(?<=\n)/)) {
+      const lb = Buffer.byteLength(line, 'utf8');
+      if (curBytes + lb <= limit) { cur += line; curBytes += lb; continue; }
+      if (cur) { parts.push(cur); cur = ''; curBytes = 0; }
+      if (lb <= limit) { cur = line; curBytes = lb; continue; }
+      let piece = '';
+      let pieceBytes = 0;
+      for (const ch of line) {
+        const cb = Buffer.byteLength(ch, 'utf8');
+        if (piece && pieceBytes + cb > limit) { parts.push(piece); piece = ''; pieceBytes = 0; }
+        piece += ch;
+        pieceBytes += cb;
+      }
+      cur = piece;
+      curBytes = pieceBytes;
+    }
+    if (cur) parts.push(cur);
+    return parts.length ? parts : [s];
   }
 
   // ── 凭据 ──────────────────────────────────────────────────────────────────
@@ -448,15 +563,30 @@ export function parseCardCallback(data) {
   return { userId, userName, chatId, data: action };
 }
 
-/** 按钮 → 文本命令（钉钉 webhook 消息无内联按钮，降级为可复制的文本指令）。 */
-export function buttonsAsCommands(buttons) {
-  return buttons.map((b) => `• ${b.label} → \`${b.id}\``).join('\n');
+/**
+ * 按钮 → 文本命令（钉钉 webhook 消息无内联按钮，降级为可复制的文本指令）。
+ *
+ * 优先用 `b.command`：钉钉 markdown 渲染不了按钮，只能降级为文字，而
+ * `approve:abc123:yes` 这种原始 callback 载荷对用户毫无意义、也无法直接发送。
+ * 核心为每个按钮提供可直接发送的友好命令（如 `/approve abc123 yes`）。
+ *
+ * 已在正文出现过的命令不再重复列出——提问卡片正文本身就带编号选项与
+ * `/answer` 用法提示，再追加一遍只是噪音（钉钉上尤其明显）。
+ */
+export function buttonsAsCommands(buttons, text = '') {
+  return buttons
+    .filter((b) => !text.includes(b.command ?? b.id))
+    .map((b) => `• ${b.label} → \`${b.command ?? b.id}\``)
+    .join('\n');
 }
 
 /** 出站文本统一追加按钮文本（无按钮渠道的降级契约）。 */
 function withButtonsAsText(out) {
   let text = out.text ?? '';
-  if (out.buttons?.length) text += '\n\n' + buttonsAsCommands(out.buttons);
+  if (out.buttons?.length) {
+    const extra = buttonsAsCommands(out.buttons, text);
+    if (extra) text += '\n\n' + extra;
+  }
   return text;
 }
 
@@ -470,10 +600,9 @@ function parseJsonSafe(value) {
   }
 }
 
-function truncate(text, max) {
-  const s = String(text ?? '');
-  return s.length <= max ? s : `${s.slice(0, max)}\n…（已截断，用 /log 获取全文）`;
-}
+// 注：原先的 `truncate(text, max)` 已移除 —— 它按**字符**截断（中文 3 字节/字），
+// 且截断提示写着「用 /log 获取全文」，而 `/log` 正是调用它的那条路径（自我指涉，
+// 永远拿不到全文）。现改为 sendFile 内按字节分段发完全部内容。
 
 export { name, inject, Config };
 export default { name, inject, Config, apply };

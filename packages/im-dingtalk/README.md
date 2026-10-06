@@ -86,6 +86,9 @@ client.registerAllEventListener(handler);               // EVENT/* 仍保留（�
 ## 已知限制
 
 - **sessionWebhook 有时效**：过期后的主动推送必须配 `robotCode`，否则只记录告警不报错
-- **文件交付降级**：钉钉 webhook 不支持直接 file 上传，`sendFile` 目前以 markdown 代码块交付
+- **文件交付降级**：钉钉 webhook 不支持直接 file 上传，`sendFile`（即 `/log` 全文交付）改用
+  **`msgtype: 'text'` 纯文本消息**按字节分段送出。**不要改回 markdown**：markdown 会解析正文里的
+  ``` / 链接 / 表格，既可能被正文自身闭合导致渲染错乱，也会让原文不再逐字保真。
+  普通出站消息仍走 markdown（`buildWebhookBody`）。
 - **卡片回调依赖开放平台配置**：未注册卡片回调时按钮不可用；文本 `/approve <id> yes|no` 始终可用
 - **@机器人**：群聊默认需 @ 才有事件；私聊不需要

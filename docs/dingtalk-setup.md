@@ -206,11 +206,43 @@ setx DINGTALK_CLIENT_SECRET "你的secret"
 
 ### 审批的两种形态
 
-- **卡片按钮**（推荐）：点一下就完成审批，无需打字
-- **文本命令**（降级）：回复 `/approve <id> yes` 或 `/approve <id> no`
+- **卡片按钮**：点一下就完成审批，无需打字
+- **文本命令**（默认，始终可用）：回复 `/approve <id> yes` 或 `/approve <id> no`
 
-> ⚠️ 卡片回调需要在开放平台额外注册。**按钮点不动时直接用文本命令**，核心的
-> `/approve` 命令始终可用，不依赖卡片配置。
+> ⚠️ 钉钉的 sessionWebhook 消息**只支持 text/markdown 等有限消息类型，不能内联交互按钮**，
+> 所以默认形态就是「文本 + 可复制的 `/approve` 命令」，正文自带用法提示，不依赖任何卡片配置。
+
+#### 想要真正的可点按钮？需要互动卡片模板
+
+实测钉钉的两种「带按钮」能力（2026-10，用本应用凭据逐个探测 `oToMessages/batchSend` 的 `msgKey`）：
+
+| msgKey | 是否被接受 | 按钮能力 |
+|---|---|---|
+| `sampleText` / `sampleMarkdown` | ✅ | 无按钮 |
+| `sampleActionCard` / `sampleActionCard2` | ✅ | **有按钮，但只能打开 URL**（`actionURL`），不能回调 |
+| `sampleCard` / `interactiveCard` | ❌ `invalidParameter.msgKey.invalid` | — |
+
+要拿到**能回调**的按钮，必须走**互动卡片（card instance）**：
+
+```bash
+# 探测结果：接口存在，且强制要求 cardTemplateId
+POST /v1.0/card/instances                  → MissingcardTemplateId
+POST /v1.0/card/instances/createAndDeliver → MissingcardTemplateId
+POST /v1.0/card/instances/deliver          → MissingoutTrackId
+```
+
+**因此需要一次性人工步骤**（只有你本组织的管理员能做）：
+
+1. 打开 [钉钉开放平台](https://open-dev.dingtalk.com) → 你的应用 → **卡片平台 / 互动卡片**
+2. 新建卡片模板，放上按钮（如「✅ 批准」「❌ 拒绝」），给按钮配置回调 id
+3. **发布**模板，复制 `cardTemplateId`
+4. 把它填进配置的 `cardTemplateId`，适配器即改走
+   `/v1.0/card/instances/createAndDeliver`（`callbackType: 'STREAM'`）发卡
+
+按钮回调不需要公网地址：Stream 长连接已订阅 `TOPIC_CARD`
+（`/v1.0/card/instances/callback`），点击事件会从同一条 WebSocket 回来。
+
+> 未配置 `cardTemplateId` 时一切照旧：文本命令始终可用，功能不缺。
 
 ---
 
@@ -221,7 +253,10 @@ setx DINGTALK_CLIENT_SECRET "你的secret"
 | `/status` 显示 `missing clientId` | 环境变量没配 | 检查 `DINGTALK_CLIENT_ID` 是否在**启动 `dsh web` 的那个环境**里 |
 | 显示 `connect failed: ...` | 凭据错 / 应用未发布 | 核对 Client ID/Secret；确认应用已**发布** |
 | **已连接但@机器人没反应** | 消息接收模式不是 Stream | 机器人配置改回「**Stream 模式**」并**重新发布** |
-| 卡片按钮点击无反应 | 卡片回调未注册 | 用文本 `/approve <id> yes` 降级 |
+| **看不到按钮/选项卡** | 钉钉 markdown 消息不支持内联按钮 | 正常现象；用正文里的文本命令。要按钮需配 `cardTemplateId`（见上） |
+| 审批卡片没到钉钉 | 被 Web 桥抢先认领 `/approval/request` | 已修（`prepend`）；确认 dsh-im ≥ 本次修复版本 |
+| 卡片正文里命令列了两遍 | 旧版 `buildWebhookBody` 重复追加 | 已修（去重） |
+| 卡片里出现 `approve:xxx:yes` 原始载荷 | 旧版降级用了内部 id | 已修（改用 `command` 友好命令） |
 | 主动通知发不出 | 没配 RobotCode / 没开权限 | 配 `DINGTALK_ROBOT_CODE` + 开 `Robot.Message.Write` |
 | 群聊里要@机器人才有反应 | 钉钉群机器人默认需 @ | 正常行为；私聊不需要 |
 

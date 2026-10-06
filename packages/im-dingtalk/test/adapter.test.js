@@ -317,24 +317,52 @@ test('回归：batchSend 返回 invalidStaffIdList 必须报错（HTTP 200 也�
   });
   await new Promise((r) => setTimeout(r, 10));
 
-  // 不得伪造成功：send() 内部吞错返回 {}，但不能返回 messageId
+  // 不得伪造成功：必须**上报失败**，核心据此 fail-closed。
+  // （此前返回 {} 是静默失败，导致提问/审批记录永远停在 waiting。）
   const r = await captured.channel.send({ chatId: 'c1', text: 'x' });
-  assert.deepEqual(r, {}, 'invalidStaffIdList 非空时不得报告成功');
+  assert.equal(r.failed, true, 'invalidStaffIdList 非空时必须上报失败');
+  assert.equal(r.reason, 'staffId.notExisted', '必须带平台错误码');
+  assert.equal(r.messageId, undefined, '不得报告 messageId');
 });
 
-test('出站：无 sessionWebhook → 走机器人推送且不抛错（robotCode 回退 clientId）', async () => {
+test('出站：核心下传 userId 时走机器人推送（robotCode 回退 clientId）', async () => {
   const { ctx, captured } = makeCtx();
   const { sdk } = makeSdkStub();
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    if (String(url).includes('gettoken')) {
+      return { ok: true, json: async () => ({ errcode: 0, access_token: 'tok', expires_in: 7200 }) };
+    }
+    calls.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ processQueryKey: 'pq-x', invalidStaffIdList: [] }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  // 核心层从持久化会话映射取到 userId 后下传（out.userId）
+  const r = await captured.channel.send({ chatId: 'cidyOPAQUE+/==', userId: '10001', text: 'x' });
+  assert.equal(r.messageId, 'pq-x');
+  assert.deepEqual(calls[0].userIds, ['10001'], '必须用下传的 userId，而不是 conversationId');
+});
+
+test('回归：无 userId 且 chatId 是 conversationId 时，必须报错而不是发注定失败的请求', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk } = makeSdkStub();
+  let pushed = false;
   const fetchImpl = async (url) => {
     if (String(url).includes('gettoken')) {
       return { ok: true, json: async () => ({ errcode: 0, access_token: 'tok', expires_in: 7200 }) };
     }
-    return { ok: true, json: async () => ({ processQueryKey: 'pq-x' }) };
+    pushed = true; // 不该走到这里
+    return { ok: true, json: async () => ({ processQueryKey: 'pq' }) };
   };
   apply(ctx, CREDS, { sdk, fetchImpl });
   await new Promise((r) => setTimeout(r, 10));
-  const r = await captured.channel.send({ chatId: 'nobody', text: 'x' });
-  assert.equal(r.messageId, 'pq-x');
+
+  // sessionWebhook 过期、且核心没给 userId → 必须放弃并上报失败
+  const r = await captured.channel.send({ chatId: 'cidyOPAQUE+/==', text: 'x' });
+  assert.equal(r.failed, true, '不应伪造成成功，必须上报失败');
+  assert.equal(r.reason, 'no-userId');
+  assert.equal(pushed, false, '不得把 conversationId 当 userId 发出去（会 staffId.notExisted）');
 });
 
 test('出站：机器人 API 报错必须带平台错误码（规则 #5 边界日志）', async () => {
@@ -348,9 +376,10 @@ test('出站：机器人 API 报错必须带平台错误码（规则 #5 边界�
   };
   apply(ctx, { clientId: 'ding-x', clientSecret: 's' }, { sdk, fetchImpl });
   await new Promise((r) => setTimeout(r, 10));
-  // send() 内部 deliver 会吞掉错误并返回 {}，但错误必须可被观测到（此处仅断言不崩溃且不误报成功）
+  // 机器人 API 报错时必须上报失败（含平台错误码），不得伪造成功结果
   const r = await captured.channel.send({ chatId: 'u1', text: 'x' });
-  assert.deepEqual(r, {}, '失败时不得伪造成功结果');
+  assert.equal(r.failed, true, '失败时不得伪造成功结果');
+  assert.ok(String(r.reason).length > 0, '必须带平台错误码/原因');
 });
 
 test('出站：robotCode 未配置时回退为 clientId（实测 Stream 机器人 robotCode == Client ID）', async () => {
@@ -369,12 +398,141 @@ test('出站：robotCode 未配置时回退为 clientId（实测 Stream 机器�
   apply(ctx, { clientId: 'ding-abc', clientSecret: 'sec' }, { sdk, fetchImpl });
   await new Promise((r) => setTimeout(r, 10));
 
-  // 无任何 sessionWebhook → 走机器人 API 分支
-  const r = await captured.channel.send({ chatId: 'staff-1', text: '主动通知' });
+  // 无任何 sessionWebhook → 走机器人 API 分支（核心下传 userId）
+  const r = await captured.channel.send({ chatId: 'staff-1', userId: '10001', text: '主动通知' });
   assert.equal(calls.length, 1, '应调用机器人推送 API');
   assert.equal(calls[0].body.robotCode, 'ding-abc', 'robotCode 必须回退为 clientId');
-  assert.deepEqual(calls[0].body.userIds, ['staff-1']);
+  assert.deepEqual(calls[0].body.userIds, ['10001']);
   assert.equal(r.messageId, 'pq-1');
+});
+
+test('回归：核心已把按钮渲染进正文时，适配器不得二次追加（单一真源）', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1', sessionWebhook: 'https://hook.example/s', sessionWebhookExpiredTime: Date.now() + 3600_000,
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 核心的约定：文本型渠道由核心拼好最终文本并清掉 buttons
+  const text = '需要审批\n\n• 批准 → /approve ab12cd yes';
+  await captured.channel.send({ chatId: 'cid-1', text });
+  const out = sent[0].markdown.text;
+  const occurrences = out.split('/approve ab12cd yes').length - 1;
+  assert.equal(occurrences, 1, `命令不得重复出现（实际 ${occurrences} 次）`);
+  assert.equal(out, text, '适配器必须原样发送核心给的最终文本');
+});
+
+test('回归：/log 不得改写正文（含 ``` 也逐字保留）', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1', sessionWebhook: 'https://hook.example/s', sessionWebhookExpiredTime: Date.now() + 3600_000,
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const original = 'line one\n```js\nconsole.log(1)\n```\nline two';
+  const r = await captured.channel.sendFile('cid-1', 'log.md', original, 'text/markdown');
+  assert.notEqual(r.failed, true, '有 webhook 时应投递成功');
+  const body = sent[sent.length - 1];
+  // 必须用纯 text：markdown 会解析正文里的 ```，且可能被正文自身闭合 → 渲染乱套
+  assert.equal(body.msgtype, 'text', '全文交付必须用纯 text 消息类型（不做 markdown 解析）');
+  const delivered = body.text.content;
+  assert.ok(delivered.includes(original), '交付内容必须逐字保留原文（不得改写 ``` / 加围栏）');
+});
+
+test('回归：/log 10 段以上时每段仍不超字节上限（序号预留随段数增长）', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1', sessionWebhook: 'https://hook.example/s', sessionWebhookExpiredTime: Date.now() + 3600_000,
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 造出 >10 段：`(10/12)` 比 `(1/2)` 多 5 字节，旧的固定 8 字节预留会失守
+  const big = '中'.repeat(14000);   // 42000 字节 → 约 15 段
+  const r = await captured.channel.sendFile('cid-1', 'big.log', big, 'text/markdown');
+  assert.notEqual(r.failed, true, '应投递成功');
+  assert.ok(sent.length >= 10, `应产生 10 段以上（实际 ${sent.length}）`);
+  for (const b of sent) {
+    assert.equal(b.msgtype, 'text');
+    const n = Buffer.byteLength(b.text.content, 'utf8');
+    assert.ok(n <= 3000, `每段必须 ≤3000 字节（实际 ${n}，共 ${sent.length} 段）`);
+  }
+  // 无损：按序去掉 header 与序号后拼回应等于原文
+  const rejoined = sent.map((b) => b.text.content.replace(/^📎 [^\n]*\n\n/, '')).join('');
+  assert.equal(rejoined, big, '分段必须无损');
+});
+
+test('回归：无 sessionWebhook 时 sendFile 必须上报失败（不得静默成功）', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk } = makeSdkStub();
+  apply(ctx, CREDS, { sdk, fetchImpl: async () => ({ ok: true, json: async () => ({ errcode: 0 }) }) });
+  await new Promise((r) => setTimeout(r, 10));
+  // 从未收到入站消息 ⇒ 没有 sessionWebhook
+  const r = await captured.channel.sendFile('nobody', 'log.md', 'content', 'text/markdown');
+  assert.equal(r.failed, true, '无投递路径必须上报失败');
+  assert.equal(r.reason, 'no-delivery-path');
+});
+
+test('回归：只有按钮没有正文时，仍把按钮命令作为正文送出（不得静默丢弃）', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1', sessionWebhook: 'https://hook.example/s', sessionWebhookExpiredTime: Date.now() + 3600_000,
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  await captured.channel.send({
+    chatId: 'cid-1',
+    buttons: [{ id: 'approve:ab:yes', label: '✅ 批准', command: '/approve ab yes' }],
+  });
+  const out = sent[sent.length - 1].markdown.text;
+  assert.ok(out.includes('/approve ab yes'), '按钮命令必须出现在正文（此前被静默丢弃）');
 });
 
 test('出站：按钮降级为文本命令（钉钉 webhook 无内联按钮）', async () => {
@@ -408,6 +566,72 @@ test('出站：按钮降级为文本命令（钉钉 webhook 无内联按钮）',
   const text = sent[0].markdown.text;
   assert.ok(text.includes('approve:ab12cd:yes'), '按钮 id 必须出现在文本命令中');
   assert.ok(text.includes('✅ 批准'));
+});
+
+test('出站：有 command 时降级为友好命令，而非内部 callback 载荷', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1', sessionWebhook: 'https://hook.example/s', sessionWebhookExpiredTime: Date.now() + 3600_000,
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  await captured.channel.send({
+    chatId: 'cid-1',
+    text: '⚠️ 需要审批',
+    buttons: [
+      { id: 'approve:ab12cd:yes', label: '✅ 批准', command: '/approve ab12cd yes' },
+      { id: 'approve:ab12cd:no', label: '❌ 拒绝', command: '/approve ab12cd no' },
+    ],
+  });
+  const text = sent[0].markdown.text;
+  assert.ok(text.includes('/approve ab12cd yes'), '应展示可复制的友好命令');
+  assert.ok(!text.includes('approve:ab12cd:yes'), '不应把内部 callback 载荷暴露给用户');
+});
+
+test('出站：正文已含该命令时不重复追加（钉钉去噪）', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1', sessionWebhook: 'https://hook.example/s', sessionWebhookExpiredTime: Date.now() + 3600_000,
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 正文自带用法（核心的提问/审批卡片都是这样）
+  await captured.channel.send({
+    chatId: 'cid-1',
+    text: '❓ 需要确认\n  1. A\n  2. B\n\n回复：`/answer 01 1` 或 `/answer 01 2`',
+    buttons: [
+      { id: 'q:01:0:0', label: '1. A', command: '/answer 01 1' },
+      { id: 'q:01:0:1', label: '2. B', command: '/answer 01 2' },
+    ],
+  });
+  const text = sent[0].markdown.text;
+  const occurrences = text.split('/answer 01 1').length - 1;
+  assert.equal(occurrences, 1, '正文已有的命令不应被追加第二遍');
+  assert.ok(!text.includes('→'), '不应出现重复的按钮文案块');
 });
 
 test('缺凭据：status 断开并给出可操作提示，不抛错', async () => {
