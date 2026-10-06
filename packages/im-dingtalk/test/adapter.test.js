@@ -497,6 +497,38 @@ test('回归：/log 10 段以上时每段仍不超字节上限（序号预留随
   assert.equal(rejoined, big, '分段必须无损');
 });
 
+test('回归：超长文件名（含 sessionId）不得让单条消息超限', async () => {
+  const { ctx, captured } = makeCtx();
+  const { sdk, state } = makeSdkStub();
+  const sent = [];
+  const fetchImpl = async (url, init) => {
+    sent.push(JSON.parse(init.body));
+    return { ok: true, json: async () => ({ errcode: 0 }) };
+  };
+  apply(ctx, CREDS, { sdk, fetchImpl });
+  await new Promise((r) => setTimeout(r, 10));
+  state.listener({
+    headers: { topic: TOPIC_ROBOT },
+    data: JSON.stringify({
+      msgtype: 'text', text: { content: 'hi' }, conversationId: 'cid-1', conversationType: '1',
+      senderStaffId: 's', msgId: 'm1', sessionWebhook: 'https://hook.example/s', sessionWebhookExpiredTime: Date.now() + 3600_000,
+    }),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 文件名含超长 sessionId（真实形态：im-<sessionId>.md）
+  const longName = `im-${'x'.repeat(4000)}.md`;
+  const r = await captured.channel.sendFile('cid-1', longName, '正文内容', 'text/markdown');
+  assert.notEqual(r.failed, true, '应投递成功');
+  for (const b of sent) {
+    const n = Buffer.byteLength(b.text.content, 'utf8');
+    // round-5 发现 3：标题膨胀会吃光预算，导致最终仍超限
+    assert.ok(n <= 3000, `超长文件名下单条仍须 ≤3000 字节（实际 ${n}）`);
+  }
+  assert.ok(sent[0].text.content.includes('正文内容'), '正文必须完整送达');
+  assert.ok(sent[0].text.content.includes('…'), '超长文件名应被无损缩短显示');
+});
+
 test('回归：无 sessionWebhook 时 sendFile 必须上报失败（不得静默成功）', async () => {
   const { ctx, captured } = makeCtx();
   const { sdk } = makeSdkStub();

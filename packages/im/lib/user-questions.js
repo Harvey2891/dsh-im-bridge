@@ -225,6 +225,8 @@ export class UserQuestionAnswerer {
       state: STATE.WAITING,
       /** 逐题草稿：qIndex → 已选标签[]。按钮应答按题累计，避免"点一题就结题"。 */
       draft: new Map(),
+      /** 逐题**自由文本**草稿：qIndex → 文本。混合题型里文字题必须能单独作答。 */
+      draftCustom: new Map(),
       resolve: (v) => {
         if (this.records.has(id)) this.records.delete(id);
         resolve(v);
@@ -274,6 +276,10 @@ export class UserQuestionAnswerer {
       `不想选：回 \`skip\`（或 \`/answer ${record.id} skip\`），agent 会自行决定后继续。`,
       record.questions.length > 1
         ? `按钮可逐题点选：答全会自动提交；也可发 \`/answer ${record.id} done\` 提前提交（未答的题按跳过）。`
+        : '',
+      // 自由文本题（无选项）必须明确告诉用户「直接回文字」是有效的
+      record.questions.some((q) => !(q.options ?? []).length)
+        ? '自由文本题：**直接回复文字**即可（自动填入尚未作答的那道文字题）。'
         : '',
     );
 
@@ -386,31 +392,78 @@ export class UserQuestionAnswerer {
     const withOptions = rec.questions
       .map((q, qi) => ((q.options ?? []).length ? qi : -1))
       .filter((qi) => qi >= 0);
+    const textQs = rec.questions
+      .map((q, qi) => ((q.options ?? []).length ? -1 : qi))
+      .filter((qi) => qi >= 0);
     const answered = withOptions.filter((qi) => rec.draft.has(qi)).length;
 
-    // 🔴 含**自由文本题**（无 options）时不能由按钮自动结题：
-    // 那种题按钮根本无法作答，自动结题会把它的答案伪造为空
-    // （round-4 发现 1，独立复验：混合题型只点有选项那题即 submitted，自由文本题 selected:[]）。
-    // 此时必须由用户显式 `/answer <id> done` 或直接回复文字。
-    const allHaveOptions = withOptions.length === rec.questions.length;
+    // 🔴 含**自由文本题**（无 options）时不能由按钮单独结题：
+    // 那种题按钮无法作答，自动结题会把它的答案伪造为空
+    // （round-4 发现 1）。必须等用户回文字（answerText）把文字题也填上，或显式 done/skip。
     const lastQ = picks.length ? picks[picks.length - 1].qIndex : 0;
     const label = rec.draft.get(lastQ)?.join('、') ?? '';
+    const complete = answered >= withOptions.length
+      && textQs.every((qi) => rec.draftCustom.has(qi));
 
-    if (allHaveOptions && answered >= withOptions.length) {
-      const answers = rec.questions.map((q, qi) => ({ id: q.id, selected: rec.draft.get(qi) ?? [] }));
-      this._settle(questionId, STATE.ANSWERED, { answers }, { accumulated: true });
-      return { status: 'answered', answered, total: withOptions.length, label };
+    if (complete) {
+      this._settle(questionId, STATE.ANSWERED, { answers: this._answersFromDraft(rec) }, { accumulated: true });
+      return { status: 'answered', answered, total: rec.questions.length, label };
     }
     // 未答全：保持等待，回报进度
     this.logLine(`question #${questionId} partial ${answered}/${withOptions.length} (${label})`);
     return {
       status: 'partial',
       answered,
-      total: withOptions.length,
+      total: rec.questions.length,
       label,
-      // 含自由文本题：告诉用户按钮无法完成，需要显式提交或打字
-      needsText: !allHaveOptions,
+      // 还有自由文本题没填 → 提示用户直接回文字
+      needsText: textQs.some((qi) => !rec.draftCustom.has(qi)),
     };
+  }
+
+  /**
+   * 自由文本作答：填入**第一道尚未作答的自由文本题**。
+   *
+   * 混合题型（部分题有选项、部分是自由文本）必须走这条路径才能完成：
+   * 此前普通文字只会落进 `dispatchTask()` 变成新任务，卡片却写着"请直接回复文字"
+   * —— 提示与实际行为矛盾（round-5 发现 1）。
+   * @returns {{status:string, qi?:number, remainingText?:number}}
+   */
+  answerText(questionId, text, from) {
+    const rec = this.records.get(questionId);
+    if (!rec || rec.state !== STATE.WAITING) return { status: 'not-found' };
+    if (from && !this._owns(rec, from)) return { status: 'forbidden' };
+    const t = String(text ?? '').trim();
+    if (!t) return { status: 'invalid' };
+
+    const textQs = rec.questions
+      .map((q, qi) => ((q.options ?? []).length ? -1 : qi))
+      .filter((qi) => qi >= 0);
+    if (textQs.length === 0) return { status: 'invalid' };
+    const target = textQs.find((qi) => !rec.draftCustom.has(qi));
+    if (target === undefined) return { status: 'invalid' };
+    rec.draftCustom.set(target, t);
+
+    const withOptions = rec.questions
+      .map((q, qi) => ((q.options ?? []).length ? qi : -1))
+      .filter((qi) => qi >= 0);
+    const answered = withOptions.filter((qi) => rec.draft.has(qi)).length;
+    const remainingText = textQs.filter((qi) => !rec.draftCustom.has(qi)).length;
+    if (answered >= withOptions.length && remainingText === 0) {
+      this._settle(questionId, STATE.ANSWERED, { answers: this._answersFromDraft(rec) }, { text: true });
+      return { status: 'answered', qi: target, remainingText: 0 };
+    }
+    this.logLine(`question #${questionId} text-filled q${target + 1}, remaining text=${remainingText}`);
+    return { status: 'partial', qi: target, remainingText };
+  }
+
+  /** 用草稿（选项 + 自由文本）组装答案；未答的题保持空。 */
+  _answersFromDraft(rec) {
+    return rec.questions.map((q, qi) => {
+      const item = { id: q.id, selected: rec.draft.get(qi) ?? [] };
+      if (rec.draftCustom.has(qi)) item.custom = rec.draftCustom.get(qi);
+      return item;
+    });
   }
 
   /**
@@ -419,11 +472,21 @@ export class UserQuestionAnswerer {
    */
   commitDraft(questionId, from) {
     const rec = this.records.get(questionId);
-    if (!rec || rec.state !== STATE.WAITING) return 'not-found';
+    if (!rec) {
+      // 🔴 continued 状态也要能提交：否则"先累计一部分 → timed 超时 → 发 done"
+      // 会返回 not-found，草稿白丢（round-5 发现 2）。
+      const cont = this.continued.get(questionId);
+      if (!cont) return 'not-found';
+      if (from && !this._owns(cont, from)) return 'forbidden';
+      if (cont.draft.size === 0 && cont.draftCustom.size === 0) return 'empty';
+      const delivered = this.deliverContinued(cont, this._answersFromDraft(cont));
+      if (delivered === 'delivered') { this.continued.delete(questionId); return 'continued'; }
+      return delivered === 'unavailable' ? 'no-continuation' : 'invalid';
+    }
+    if (rec.state !== STATE.WAITING) return 'not-found';
     if (from && !this._owns(rec, from)) return 'forbidden';
-    if (rec.draft.size === 0) return 'empty';
-    const answers = rec.questions.map((q, qi) => ({ id: q.id, selected: rec.draft.get(qi) ?? [] }));
-    this._settle(questionId, STATE.ANSWERED, { answers }, { committed: true });
+    if (rec.draft.size === 0 && rec.draftCustom.size === 0) return 'empty';
+    this._settle(questionId, STATE.ANSWERED, { answers: this._answersFromDraft(rec) }, { committed: true });
     return 'answered';
   }
 

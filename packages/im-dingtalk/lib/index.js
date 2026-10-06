@@ -26,6 +26,41 @@ export const TOPIC_CARD = '/v1.0/card/instances/callback';
  */
 const MAX_BYTES_FOR_CODE = 3000;
 
+/**
+ * 把**展示用**文件名缩短到 ≤ maxBytes UTF-8 字节（只影响标题显示，不影响正文）。
+ *
+ * 为什么需要：`/log` 的文件名含 `binding.sessionId`，长度不受限；标题本身要占用
+ * 单条消息的字节预算，标题一旦膨胀到吃光预算，正文就被 `Math.max(1, …)` 钳成
+ * 1 字节，最终整条仍会超限（round-5 发现 3）。
+ * 缩短策略：保留**首尾**（可辨认是哪个会话），中间用 `…` 省略；按码点截断，
+ * 不会切坏多字节字符。
+ */
+function shortenForDisplay(name, maxBytes) {
+  const s = String(name ?? '');
+  const limit = Math.max(8, Math.floor(maxBytes));
+  if (Buffer.byteLength(s, 'utf8') <= limit) return s;
+  const chars = [...s];
+  const head = [];
+  const tail = [];
+  // 先各留一半预算，再从尾部补足
+  let used = 0;
+  const budget = limit - Buffer.byteLength('…', 'utf8');
+  for (const ch of chars) {
+    const n = Buffer.byteLength(ch, 'utf8');
+    if (used + n > budget / 2) break;
+    head.push(ch);
+    used += n;
+  }
+  for (let i = chars.length - 1; i >= 0; i--) {
+    const ch = chars[i];
+    const n = Buffer.byteLength(ch, 'utf8');
+    if (used + n > budget) break;
+    tail.unshift(ch);
+    used += n;
+  }
+  return `${head.join('')}…${tail.join('')}`;
+}
+
 const Config = z.object({
   clientId: z.string().default('env:DINGTALK_CLIENT_ID'),
   clientSecret: z.string().default('env:DINGTALK_CLIENT_SECRET'),
@@ -340,14 +375,17 @@ export function apply(ctx, config = {}, internals = {}) {
   }
 
   /**
-   * 文件投递（/log 全量交付，FR-3.4）：钉钉 webhook 不支持直接 file 上传，
-   * 故以 markdown 代码块形式交付。
+   * 文件投递（`/log` 全量交付，FR-3.4）：钉钉 webhook 不支持直接 file 上传，
+   * 故以 **`msgtype: 'text'` 纯文本消息**按 UTF-8 字节分段送出。
    *
-   * 🔴 两条硬约束（round-2 发现 3、4）：
-   * 1. **不得改写正文**：`/log` 的语义是"取全文"，此前按字符截断、又把 ``` 替换成
-   *    `` ` ` ` ``，交付的已不是原文。现在正文逐字节原样送出；仅当正文**不含** ```
-   *    时才套代码围栏（避免围栏被正文闭合），含围栏时改用缩进式呈现。
-   * 2. **无投递路径必须上报失败**：没有 sessionWebhook 时此前静默 `return {}`，
+   * 🔴 三条硬约束（round-2/3/5 发现）：
+   * 1. **不得改写正文**：`/log` 的语义是"取全文"。此前按**字符**截断，
+   *    还把 ``` 替换成 `` ` ` ` `` —— 交付的已不是原文。现在正文逐字节原样送出。
+   * 2. **必须用纯 text，不要改回 markdown**：markdown 会解析正文里的 ``` / 链接 /
+   *    表格，既可能被正文自身闭合导致渲染错乱，也会让原文在视觉上被改写；
+   *    纯 text 不做任何解析，于是"逐字保真"与"可读"同时成立。
+   *    （普通出站消息仍走 markdown —— 见 `buildWebhookBody`。）
+   * 3. **无投递路径必须上报失败**：没有 sessionWebhook 时此前静默 `return {}`，
    *    调用方以为成功、用户却什么都没收到。
    */
   async function sendFile(chatId, fileName, text, mime = 'text/plain') {
@@ -361,7 +399,10 @@ export function apply(ctx, config = {}, internals = {}) {
     }
     try {
       const raw = String(text ?? '');
-      const header = `📎 ${fileName}`;
+      // 🔴 标题（含文件名）本身会占用单条预算：文件名带 sessionId 时可能很长。
+      // 若标题膨胀到吃光预算，`Math.max(1, ...)` 会把正文钳成 1 字节，最终仍超限
+      // （round-5 发现 3）。这里对**展示用**文件名做无损缩短（只影响显示，不影响正文）。
+      const header = `📎 ${shortenForDisplay(fileName, MAX_BYTES_FOR_CODE / 3)}`;
       const headerBytes = Buffer.byteLength(header, 'utf8');
       // 序号 ` (i/n)\n\n` 的字节数 = 1+1+d_i+1+d_n+1 + 2（换行） = d_i+d_n+6，
       // 最坏取同位数 2d+6。固定 8 字节在 10 段以上就不够（round-4 发现 2）。

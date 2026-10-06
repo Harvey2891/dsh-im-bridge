@@ -580,6 +580,79 @@ test('回归：混合题型（有选项 + 自由文本）不得被按钮自动�
   }
 });
 
+test('回归：混合题型回文字可完成提问（提示与实际行为一致）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选一个', options: [{ label: 'a' }, { label: 'b' }] },
+      { id: 'q2', question: '项目叫什么？' },   // 自由文本题
+    ]);
+    // 先点有选项那题 → partial（含自由文本题，不自动结题）
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'user-1', userName: 'Tester',
+      data: `q:${qid}:0:1`,
+    });
+    assert.equal(im.userQuestions.records.size, 1, '含自由文本题时先保持等待');
+
+    // 再直接回文字 → 应填入自由文本题并完成整批
+    // （round-5 发现 1：此前混合题型的普通文字会落进派活，提问永久挂着）
+    await mock.sendFromUser({ text: '我的项目名' });
+
+    const ans = await p;
+    assert.deepEqual(ans.answers, [
+      { id: 'q1', selected: ['b'] },
+      { id: 'q2', selected: [], custom: '我的项目名' },
+    ], '文字必须填入自由文本题，且与选项题的答案一起提交');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：continued 状态下 done 仍能提交草稿（草稿不白丢）', async () => {
+  const delivered = [];
+  const svc = { answer: (agent, callId, answer) => { delivered.push({ callId, answer }); return true; } };
+  const { UserQuestionAnswerer } = await import('../lib/user-questions.js');
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: (k) => (k === 'userQuestions' ? svc : undefined) },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => {},
+    logLine: () => {},
+    cfg: {},
+  });
+  const ac = new AbortController();
+  const p = a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+      signal: ac.signal,
+      wait: { callId: 'call-7', timed: true },
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const id = [...a.records.keys()][0];
+  const from = { platform: 'mock', chatId: 'c1' };
+  a.accumulate(id, [{ qIndex: 0, oIndex: 1 }], from);   // 先累计一部分
+  ac.abort();                                          // timed 超时 → 转 continued
+  await assert.rejects(p);
+  assert.equal(a.continued.size, 1);
+
+  // round-5 发现 2：此前 commitDraft 只查 records，continued 下 done 会 not-found
+  assert.equal(a.commitDraft(id, from), 'continued', 'continued 下 done 必须能提交草稿');
+  assert.equal(delivered.length, 1, '必须经继续协议送达');
+  // DSH 要求答案批必须"每题恰好一次"
+  assert.deepEqual(delivered[0].answer.answers, [
+    { id: 'q1', selected: ['a2'] },
+    { id: 'q2', selected: [] },
+  ]);
+});
+
 test('派活 → 审批 → 放行 → 结果卡片（全链路）', async () => {
   const script = [
     {

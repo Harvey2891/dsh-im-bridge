@@ -418,21 +418,27 @@ export class ImRuntime extends Service {
         await this.commandAnswer(msg, [pendingQ.id, t]);
         return;
       }
-      // 无预设选项的问题：卡片提示「请直接回复文字」，就得把这条文本当答案收下，
-      // 否则提示与实际行为矛盾（文字进了派活，提问一直挂着）。
-      const noOptions = pendingQ.questions.every((q) => !(q.options ?? []).length);
-      if (noOptions && !parseCommand(t)) {
-        const result = this.userQuestions.respond(String(pendingQ.id), [], t, {
-          platform, chatId,
-        });
+      // 自由文本作答：把这条文本填进**尚未作答的自由文本题**。
+      // 覆盖两种卡片：(a) 全部问题都无 options；(b) 混合题型（部分有选项、部分是自由文本）。
+      // 此前只处理 (a)，于是混合题型的文字会落进派活、提问永久挂着，
+      // 而回调文案还写着「请直接回复文字」——提示与行为矛盾（round-5 发现 1）。
+      const textQs = pendingQ.questions
+        .map((q, qi) => ((q.options ?? []).length ? -1 : qi))
+        .filter((qi) => qi >= 0);
+      const hasUnfilledText = textQs.some((qi) => !pendingQ.draftCustom.has(qi));
+      if (textQs.length > 0 && hasUnfilledText && !parseCommand(t)) {
+        const r = this.userQuestions.answerText(String(pendingQ.id), t, { platform, chatId });
         const texts = {
-          answered: `✅ 已回答提问 #${pendingQ.id}，agent 继续。`,
+          answered: `✅ 已回答提问 #${pendingQ.id} 的第 ${(r.qi ?? 0) + 1} 题，agent 继续。`,
           'not-found': `ℹ️ 提问 #${pendingQ.id} 不存在、已回答或已超时。`,
           forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
-          continued: `✅ 已回答提问 #${pendingQ.id}（此前已超时挂起，答案已转交 agent）。`,
-          'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案。',
+          invalid: '⚠️ 该题已答或不是自由文本题，请按卡片编号回复。',
         };
-        await this.send({ platform, chatId }, { text: texts[result] ?? `ℹ️ ${result}` });
+        await this.send({ platform, chatId }, {
+          text: r.status === 'partial'
+            ? `📝 已记录提问 #${pendingQ.id} 第 ${(r.qi ?? 0) + 1} 题的文字；还有 ${r.remainingText} 道文字题未答。`
+            : (texts[r.status] ?? `ℹ️ ${r.status}`),
+        });
         return;
       }
     }
