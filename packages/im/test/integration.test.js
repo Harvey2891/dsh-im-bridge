@@ -1194,6 +1194,37 @@ test('回归：并发替换后 /new 失败回滚不得误删他人绑定（round
   }
 });
 
+test('回归：多题卡分次手打编号——合法部分答案回执"已记录"且可续答（round-6 F1）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '环境？', options: [{ label: 'staging' }, { label: 'production' }] },
+      { id: 'q2', question: '备份？', options: [{ label: '要' }, { label: '不要' }] },
+    ]);
+    mock.reset();
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '1.1']);
+
+    // 旧版：合法 pick 已进草稿却回执"编号越界"（状态与回执矛盾，用户以为被拒）
+    assert.ok(mock.sent.some((m) => m.text?.includes('已记录选择')), '合法部分答案应回执"已记录选择"');
+    assert.ok(mock.sent.some((m) => m.text?.includes('1/2 题')), '回执应给出已答题数（1/2）');
+    assert.ok(!mock.sent.some((m) => m.text?.includes('编号越界')), '合法部分答案不得报"编号越界"');
+    assert.equal(im.userQuestions.records.size, 1, '提问仍在等待（未提前结题）');
+
+    mock.reset();
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '2.2']);
+    const ans = await p;
+    assert.deepEqual(ans.answers, [
+      { id: 'q1', selected: ['staging'] },
+      { id: 'q2', selected: ['不要'] },
+    ], '分次手打的选择必须都进入最终答案');
+  } finally {
+    await teardown();
+  }
+});
+
 test('回归：/new 双击合并处理（同聊天串行化，round-4 P2-2）', async () => {
   const { mock, im, teardown } = await setup(QSCRIPT);
   try {

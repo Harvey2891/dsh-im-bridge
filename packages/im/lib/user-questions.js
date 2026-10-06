@@ -243,6 +243,13 @@ export class UserQuestionAnswerer {
   renderCard(record) {
     const lines = [`❓ **需要你的确认**  #${record.id}`];
     const buttons = [];
+    // 🔴 整卡题型判定（新计轮 round-6 F2）：必须在题目循环**之前**计算——
+    // 混合卡（选项题+文字题）下，题目旁"请直接回复文字"的提示与实际行为
+    // 矛盾（普通文字会被 dispatchTask 当新任务，答案不进草稿），必须引导
+    // 显式 `/answer <id> text` 语法。
+    const hasOptions = record.questions.some((q) => (q.options ?? []).length);
+    const hasText = record.questions.some((q) => !(q.options ?? []).length);
+    const mixed = hasOptions && hasText;
 
     record.questions.forEach((q, qi) => {
       if (record.questions.length > 1) lines.push('', `**${qi + 1}. ${q.question}**`);
@@ -266,12 +273,11 @@ export class UserQuestionAnswerer {
           command: `/answer ${record.id} ${label}`,
         });
       });
-      if (opts.length === 0) lines.push('  （无预设选项，请直接回复文字）');
+      if (opts.length === 0) lines.push(mixed
+        ? `  （无预设选项：请发 \`/answer ${record.id} text <内容>\` 作答——本卡为混合题型，直接回复文字会被当作新任务）`
+        : '  （无预设选项，请直接回复文字）');
     });
 
-    const hasOptions = record.questions.some((q) => (q.options ?? []).length);
-    const hasText = record.questions.some((q) => !(q.options ?? []).length);
-    const mixed = hasOptions && hasText;
     // 🔴 示例必须**从卡片实际题目派生**（新计轮 round-4 P2-1 → round-5 P2）：
     // ① 单选票卡**不得**出现"逗号分隔，如 1,3"——照抄会被 `n>1 && !multiSelect` 拒绝（invalid）；
     // ② 多题卡必须引导点号格式（裸编号在多题解析下全部映射第 1 题）；
@@ -356,7 +362,7 @@ export class UserQuestionAnswerer {
    *        （**按钮路径**必须开：一次点击只携带一个 (q,o)，多问题卡片否则永远
    *        `invalid`、用户无法完成作答 —— round-2 发现 2）；文字命令路径则应答全，
    *        以便用户能明确表达"哪些题我不选"。
-   * @returns {'answered'|'incomplete'|'not-found'|'invalid'|'forbidden'}
+   * @returns {'answered'|'incomplete'|'partial'|'not-found'|'invalid'|'forbidden'}
    */
   respond(questionId, picks, custom, from, opts = {}) {
     const rec = this._find(questionId);
@@ -365,8 +371,14 @@ export class UserQuestionAnswerer {
     if (from && !this._owns(rec, from)) return 'forbidden';
     const err = this._merge(rec, { picks, text: custom });
     if (err) return err;
-    // 文字命令路径要求答全（用户能明确表达"哪些题不选"）；按钮路径（accumulate）才允许部分
-    if (!opts.allowPartial && !this._isComplete(rec)) return 'invalid';
+    // 文字命令路径要求答全才结算（用户能明确表达"哪些题不选"）；
+    // 按钮路径（accumulate）才允许部分。
+    // 🔴 区分"合法已记录未答全"与"非法输入"（新计轮 round-6 F1）：_merge 已
+    // 原子写入——草稿已改变。此处若回 'invalid'，commandAnswer 会回执
+    // "编号越界"，用户以为被拒而重答或只答其余题，之前已记录的选择会
+    // 与新答案一起提交（状态与回执矛盾）。回 'partial'（已记录，可续答）；
+    // 结算门（完整性 + 多选 done）不变，不会提前提交。
+    if (!opts.allowPartial && !this._isComplete(rec)) return 'partial';
     // 🔴 含多选题的卡片**任何入口都不自动结题**（统一结题门，round-2 P1-1）：
     // 多选"已有一项"≠"选完了"。此前只堵了 accumulate，`/answer <id> 1` 在单题多选卡
     // 上仍一答即提交、第二项失效。多选卡必须显式 `done`（commitDraft）。

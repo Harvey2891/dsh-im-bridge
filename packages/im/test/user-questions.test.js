@@ -368,7 +368,7 @@ test('回归：无任何选择时 done 被拒（不伪造结题）', async () =>
   await p;
 });
 
-test('回归：文字命令路径必须答全（未答的题返回 invalid 并保持等待）', async () => {
+test('回归：文字命令路径合法部分答案已记录可续答（round-6 F1）', async () => {
   const { a } = makeAnswerer();
   const p = a.answer(
     {
@@ -382,10 +382,13 @@ test('回归：文字命令路径必须答全（未答的题返回 invalid 并�
   );
   await new Promise((r) => setTimeout(r, 10));
   const id = [...a.records.keys()][0];
+  // 🔴 旧行为：合法部分答案返回 'invalid'（回执"编号越界"），但 _merge 已原子
+  // 写入草稿——状态与回执矛盾。现在返回 'partial'（已记录、继续等待），
+  // 结算门（答全才自动提交）保持不变。
   assert.equal(
     a.respond(id, [{ qIndex: 0, oIndex: 0 }], undefined, { platform: 'mock', chatId: 'c1' }),
-    'invalid',
-    '文字路径下只答一题应提示 invalid',
+    'partial',
+    '文字路径下合法但未答全 → partial（已记录），不再是 invalid',
   );
   assert.equal(a.records.size, 1, '必须仍在等待');
   assert.equal(
@@ -492,6 +495,62 @@ test('回归：第 1 题为文字题时选项示例必须指向真实选项题�
   const m = card.text.match(/如 `(\d+)\.(\d+)`/);
   assert.ok(m, '多题卡应有点号示例');
   assert.equal(Number(m[1]), 2, '第 1 题是文字题：示例必须指向第 2 题（照抄 1.x 会越界 invalid）');
+});
+
+test('回归：respond 合法部分答案返回 partial 而非 invalid（round-6 F1）', async () => {
+  const { a } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  // 合法但未答全：草稿已原子记录，状态必须是 partial（已记录、可续答），
+  // 不能再是 invalid（旧版回执"编号越界"与草稿实际状态矛盾）。
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 0 }]), 'partial', '合法部分答案应为 partial');
+  // 真·非法输入仍为 invalid（且原子性：草稿不被半写）
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 99 }]), 'invalid', '越界 pick 仍 invalid');
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 1 }, { qIndex: 0, oIndex: 0 }]), 'invalid', '单选同题多 pick 仍 invalid');
+});
+
+test('回归：混合卡题目旁提示指向 text 语法（round-6 F2）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: '选一个', options: [{ label: 'a' }, { label: 'b' }] },
+        { id: 'q2', question: '项目叫什么？' }, // 自由文本题
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+  // 混合卡下普通文字会被 dispatchTask 当新任务——题目旁提示不得再写"直接回复文字"
+  assert.ok(!card.text.includes('请直接回复文字'), '混合卡不得引导"直接回复文字"（会被当作新任务）');
+  assert.ok(card.text.includes('/answer 01 text'), '混合卡题目旁提示必须给出 /answer <id> text 语法');
+});
+
+test('回归：全文字卡仍引导直接回复文字（round-6 F2 负向对照）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [{ id: 'q1', question: '工单号？' }],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+  assert.ok(card.text.includes('请直接回复文字'), '全文字卡保持"直接回复文字"提示');
 });
 
 test('回归：单选票卡不得出现逗号多选示例（round-4 P2-1）', async () => {

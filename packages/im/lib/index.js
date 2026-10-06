@@ -1365,12 +1365,17 @@ export class ImRuntime extends Service {
     const result = this.userQuestions.respond(String(id), picks, custom, {
       platform: msg.platform, chatId: msg.chatId,
     });
+    // 🔴 partial 回执（round-6 F1）：草稿已记录的题数，让用户明确进度。
+    const answeredN = rec.questions.filter((q, qi) => (q.options ?? []).length ? rec.draft.has(qi) : rec.draftCustom.has(qi)).length;
     const texts = {
       answered: `✅ 已回答提问 #${id}，agent 继续。`,
       'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
       // 🔴 多选卡"答全也不自动结题"（统一结题门，round-2 P1-1）：
       // 草稿已记录，必须显式 done 提交（多选"已有一项"≠"选完了"）。
       incomplete: `📝 已记录选择——该卡片含**多选题**，请继续作答后发 \`/answer ${id} done\` 提交。`,
+      // 🔴 合法部分答案（新计轮 round-6 F1）：多题卡分次手打编号时，已记录的
+      // 选择保留在草稿，继续作答或 done 提前提交；不再是误导性的"编号越界"。
+      partial: `📝 已记录选择（${answeredN}/${rec.questions.length} 题）——请继续作答其余题目，或发 \`/answer ${id} done\` 提交当前进度（未答的题按跳过）。`,
       invalid: rec.questions.some((q) => !(q.options ?? []).length)
         // 卡片含自由文本题：文字题必须用显式语法，编号只能答选项题
         ? `⚠️ 还没答完——该卡片含**自由文本题**，请用 \`/answer ${id} text <内容>\` 回答文字题，或发 \`/answer ${id} done\` 提交当前选择。`
