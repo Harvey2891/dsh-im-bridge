@@ -13,7 +13,9 @@
 import { markdownToText, resultCard, estimateCost, splitLongText } from './renderer.js';
 
 const FLUSH_CHARS = 1400; // 或累计 N 字符强制 flush
-const MAX_RESERVOIR = 3500;
+// 蓄水池上限：离线/静音/静默时段只蓄水不推送，长 turn 下必须有界（round-2 P2-8）。
+// 取 ~256KB 字符量级：远超任何单次流式增量，又不会让内存失控。
+const RESERVOIR_MAX_CHARS = 256 * 1024;
 
 export class NotifyBus {
   /**
@@ -41,6 +43,8 @@ export class NotifyBus {
     this.streamWhileOnline = true;
     this.onlineWindowMin = 10;
     this.flushIntervalMs = 400;
+    /** sessionId → 最近 turn 是否失败（/retry 门用，round-2 P2-6） */
+    this.markTurnFailed = null;
     this._dispose = [];
     this._lastPush = new Map(); // `${sessionId}:${kind}` → ts（1 分钟聚合）
   }
@@ -55,6 +59,7 @@ export class NotifyBus {
     this.streamWhileOnline = cfg.streamWhileOnline ?? true;
     this.onlineWindowMin = cfg.onlineWindowMin ?? 10;
     this.flushIntervalMs = cfg.flushIntervalMs ?? 400;
+    if (cfg.markTurnFailed) this.markTurnFailed = cfg.markTurnFailed;
   }
 
   mount() {
@@ -105,6 +110,9 @@ export class NotifyBus {
   onAgentError(agent, error) {
     const binding = this.map.bySessionId(agent.id);
     if (!binding) return;
+    // 🔴 muted 门必须与 sendReservoir 一致（round-2 P2-3）：此前只有流式检查 muted，
+    // 错误卡/结果卡照发 ⇒ `/mute` 对用户仍是"半失效"。
+    if (binding.muted) return;
     if (!this.onError) return;
     if (this.inQuietHours()) return;
     const session = this.state(agent.id);
@@ -150,6 +158,12 @@ export class NotifyBus {
   appendStream(binding, text) {
     const s = this.state(binding.sessionId);
     s.reservoir += text;
+    // 🔴 蓄水池必须有界（round-2 P2-8）：离线/静音/静默时段只蓄水不推送，
+    // 长 turn 可把内存推到无界。截尾保留（结果卡只引用 lastAssistantText，
+    // 蓄水池内容只是过程性流式输出，丢头不丢尾对用户更友好）。
+    if (s.reservoir.length > RESERVOIR_MAX_CHARS) {
+      s.reservoir = s.reservoir.slice(-RESERVOIR_MAX_CHARS);
+    }
     if (!this.streamWhileOnline || !this.map.isOnline(binding.platform, binding.chatId, this.onlineWindowMin * 60_000)) {
       // 人不在：只蓄水不推送（结果卡片兜底）
       return;
@@ -229,6 +243,14 @@ export class NotifyBus {
           : reason.kind === 'max-tokens' ? 'max-tokens'
             : reason.kind === 'blocked' ? 'blocked'
               : reason.kind === 'interrupted' ? 'interrupted' : 'completed';
+
+    // 🔴 /retry 的失败上下文（round-2 P2-6）：只有**上一 turn 真的失败**才允许重试，
+    // 否则用户在成功任务后发 /retry 会把（可能带写操作的）任务原样重跑一遍。
+    if (this.markTurnFailed) this.markTurnFailed(binding.sessionId, status === 'error');
+
+    // 🔴 muted 门（round-2 P2-3）：静默聊天不推结果卡；蓄水池已在上面清掉，
+    // 不会因跳过推送而堆积。审批仍走独立路径（见 /mute 回执文案）。
+    if (binding.muted) return;
 
     // 聚合：同一任务只推 1 条结果通知（turn 已唯一）
     const costText = this.includeCost ? estimateCost(s.lastUsage, this.pricing) : null;

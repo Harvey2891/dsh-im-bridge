@@ -7,9 +7,9 @@ import { join } from 'node:path';
 import { ApprovalManager } from '../lib/approvals.js';
 import { SessionMap } from '../lib/session-map.js';
 
-function makeManager({ timeoutSec = 0.1, pendingMaxSec = 0.3, autoApproveRisk = 'none', riskRules } = {}) {
+function makeManager({ timeoutSec = 0.1, pendingMaxSec = 0.3, autoApproveRisk = 'none', riskRules, sendImpl, logCollect } = {}) {
   const sent = [];
-  const logs = [];
+  const logs = logCollect ?? [];
   const dir = mkdtempSync(join(tmpdir(), 'im-ap-'));
   const map = new SessionMap(dir);
   map.create('mock', 'c1', { chatType: 'private' });
@@ -17,7 +17,7 @@ function makeManager({ timeoutSec = 0.1, pendingMaxSec = 0.3, autoApproveRisk = 
   const mgr = new ApprovalManager({
     ctx: { on: () => () => {} },
     map,
-    send: async (chat, out) => { sent.push({ ...out, chat }); return {}; },
+    send: sendImpl ?? (async (chat, out) => { sent.push({ ...out, chat }); return {}; }),
     logLine: (line) => logs.push(line),
   });
   mgr.configure({
@@ -135,7 +135,10 @@ test('审批：非 allowlist 用户不能审批（§10 回调身份校验）', a
 });
 
 test('超时可恢复拒绝（FR-6.4）：超时 → pending + 提醒；再超 → rejected', async () => {
-  const { mgr, sent } = makeManager({ timeoutSec: 0.05, pendingMaxSec: 0.1 });
+  const { mgr, sent } = makeManager({
+    timeoutSec: 0.05, pendingMaxSec: 0.1,
+    sendTimeoutSec: 5, // 看门狗必须晚于两个测试超时，否则先决 unavailable
+  });
   const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash' };
   const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
   await new Promise((r) => setTimeout(r, 120));
@@ -147,7 +150,10 @@ test('超时可恢复拒绝（FR-6.4）：超时 → pending + 提醒；再超 �
 });
 
 test('超时后仍可恢复审批（pending 窗口内 /approve yes）', async () => {
-  const { mgr, sent } = makeManager({ timeoutSec: 0.05, pendingMaxSec: 60 });
+  const { mgr, sent } = makeManager({
+    timeoutSec: 0.05, pendingMaxSec: 60,
+    sendTimeoutSec: 5,
+  });
   const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash' };
   const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
   await new Promise((r) => setTimeout(r, 120));
@@ -191,4 +197,84 @@ test('会话取消 → cancelled', async () => {
   await new Promise((r) => setTimeout(r, 10));
   ac.abort();
   assert.equal(await p, 'cancelled');
+});
+
+// ── 回归：推送挂死不得卡死审批（round-2 P1-2） ──────────────────────────────
+//
+// 症状：渠道 send 永不 settle（webhook 挂死）时，prompt() 永久卡在 await send，
+// 审批超时计时器也还没启动 ⇒ 审批瀑布流挂死、agent 卡住。
+// 修复：① 发送看门狗（sendTimeoutSec，默认 60s，测试里调小）先决者胜；
+//       ② 决议时移除 abort 监听（{once:true} 只在触发时移除，未触发会泄漏）。
+
+test('回归：发送永不 settle → 看门狗按 unavailable 兜底（P1-2）', async () => {
+  const sent = [];
+  const logs = [];
+  const { mgr } = makeManager({
+    timeoutSec: 60,
+    pendingMaxSec: 120,
+    sendImpl: (chat, out) => {
+      sent.push({ ...out, chat });
+      return new Promise(() => {}); // 永不 settle
+    },
+    logCollect: logs,
+  });
+  mgr.configure({
+    enabled: true, timeoutSec: 60, pendingMaxSec: 120, autoApproveRisk: 'none',
+    riskRules: [{ tool: 'tool-bash', args: 'rm -rf', risk: 'high' }],
+    sendTimeoutSec: 0.2,
+  });
+  const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash' };
+  const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
+  // 注意：此处**不** await p —— p 会卡在挂死的 await send 上（挂死的是渠道，
+  // 不是审批）。看门狗触发后审批状态机立即解锁：record 删除、日志落
+  // unavailable、后续 respond 报 ignored。断言这些状态事实而不是等 p。
+  await new Promise((r) => setTimeout(r, 500));
+  assert.ok(sent.some((m) => m.text?.includes('推送超时')), '应补发推送超时提醒');
+  // 记录已决，不留 waiting 残留
+  assert.equal(mgr.records.size, 0, '看门狗结算后记录必须删除');
+  // 审批日志落 unavailable（fail-closed）
+  assert.ok(logs.some((l) => l.outcome === 'unavailable'), '日志应记录 unavailable');
+  // 后续 respond 应报 ignored（已决窗口内）
+  const card = sent.find((m) => m.buttons?.length);
+  const id = card.buttons[0].id.split(':')[1];
+  assert.equal(mgr.respond(id, 'yes', { platform: 'mock', userId: 'u1' }), 'ignored');
+});
+
+test('回归：发送期间 abort → 记录立即 cancelled（P1-2 时序）', async () => {
+  const { mgr } = makeManager({
+    timeoutSec: 60,
+    pendingMaxSec: 120,
+    sendImpl: (chat, out) => {
+      return new Promise((resolve) => setTimeout(() => resolve({}), 50));
+    },
+  });
+  mgr.configure({
+    enabled: true, timeoutSec: 60, pendingMaxSec: 120, autoApproveRisk: 'none',
+    riskRules: [{ tool: 'tool-bash', args: 'rm -rf', risk: 'high' }],
+    sendTimeoutSec: 60,
+  });
+  const ac = new AbortController();
+  const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash', signal: ac.signal };
+  const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
+  await new Promise((r) => setTimeout(r, 10)); // 发送 in-flight
+  ac.abort();
+  // 记录在 abort 后**立即**（下一个微任务）即决——不等待发送返回。
+  // 用短延迟断言"快"，而不是同一 tick 的同步断言（resolve 是微任务结算）。
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(mgr.records.size, 0, 'abort 后记录必须立即删除（不等待发送返回）');
+  assert.equal(await p, 'cancelled');
+});
+
+test('回归：abort 监听在决议时移除（不泄漏，P1-2 连带）', async () => {
+  const { mgr } = makeManager({ timeoutSec: 60 });
+  const ac = new AbortController();
+  const req = { agent: { id: 'im-mock-c1' }, toolName: 'tool-bash', signal: ac.signal };
+  const p = mgr.prompt(req, { platform: 'mock', chatId: 'c1', sessionId: 'im-mock-c1' });
+  await new Promise((r) => setTimeout(r, 10));
+  const id = mgr.pendingList()[0].id;
+  mgr.respond(id, 'no', { platform: 'mock', userId: 'u1' });
+  assert.equal(await p, 'rejected');
+  // 决议（非 abort 触发）后监听必须已移除：计数归零
+  const listeners = ac.signal.listeners?.('abort') ?? [];
+  assert.equal(listeners.length, 0, '决议后 abort 监听必须移除（{once:true} 只在触发时移除，会泄漏）');
 });

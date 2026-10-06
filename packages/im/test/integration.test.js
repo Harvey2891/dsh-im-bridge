@@ -903,6 +903,229 @@ test('回归：/mute 必须真的静默通知（F14）', async () => {
   }
 });
 
+// ── round-2 复审修复的回归（P1-1 / P1-2 连带 / P2 簇） ─────────────────────
+
+test('回归：多选卡经 /answer 命令也不得自动结题（round-2 P1-1）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选几个？', options: [{ label: 'a' }, { label: 'b' }, { label: 'c' }], multiSelect: true },
+    ]);
+    // 此前：_isComplete 只看 draft.has(qi) → 第一项即结题，第二项 not-found
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '1']);
+    assert.equal(im.userQuestions.records.size, 1, '多选卡 /answer 1 后必须继续等待');
+    const incomplete = mock.sent.find((m) => m.text?.includes('多选题'));
+    assert.ok(incomplete, '回执应明确提示多选题需显式 done');
+    assert.ok(incomplete.text.includes('/answer'), '回执应给出 /answer <id> done 路径');
+
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, '3']);
+    assert.equal(im.userQuestions.records.size, 1, '第二项后仍未结题');
+
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, 'done']);
+    const ans = await p;
+    assert.deepEqual(ans.answers, [{ id: 'q1', selected: ['a', 'c'] }], '多选累计两项后由 done 提交');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：mixed 卡（多选+文字）填完文字也不得自动结题（round-2 P1-1）', async () => {
+  const { im, teardown } = await setup(QSCRIPT);
+  try {
+    await (im.map.get('mock', 'chat-1') ?? im.createBinding('mock', 'chat-1', 'private'));
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选几个？', options: [{ label: 'a' }, { label: 'b' }], multiSelect: true },
+      { id: 'q2', question: '备注？' },
+    ]);
+    // 先点一个多选选项（按钮路径累计）
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'user-1', userName: 'T', data: `q:${qid}:0:0`,
+    });
+    assert.equal(im.userQuestions.records.size, 1, '多选第一项后继续等待');
+    // 文字题填完的瞬间，卡片"形式上答全"——但多选未完成，不得结题
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, 'text', '备注内容']);
+    assert.equal(im.userQuestions.records.size, 1, '文字题填完但多选未完成 → 必须继续等待');
+
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, 'done']);
+    const ans = await p;
+    assert.deepEqual(ans.answers, [
+      { id: 'q1', selected: ['a'] },
+      { id: 'q2', selected: [], custom: '备注内容' },
+    ]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：/mute 后错误卡与结果卡都被静默（round-2 P2-3）', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: 'ok' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    const binding = im.map.get('mock', 'chat-1');
+
+    await im.commandMute({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, true);
+    assert.equal(binding.muted, true);
+
+    // 结果卡：此前 handleTurnEnd 不查 muted，照发
+    mock.reset();
+    im.notify.handleTurnEnd(binding, { reason: { kind: 'completed' }, message: { content: [{ type: 'text', text: 'done' }] } });
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(mock.sent.length, 0, '/mute 后结果卡必须被静默（此前 handleTurnEnd 不查 muted）');
+
+    // 错误卡：此前 onAgentError 不查 muted，照发
+    im.notify.onAgentError({ id: binding.sessionId }, new Error('boom'));
+    await new Promise((r) => setTimeout(r, 80));
+    assert.equal(
+      mock.sent.filter((m) => m.text?.includes('Agent 出错')).length,
+      0, '/mute 后错误卡必须被静默',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：/retry 只在最近一次任务失败后可用（round-2 P2-6）', async () => {
+  const script = [
+    {
+      chunks: [
+        { type: 'text-delta', index: 0, text: 'ok' },
+        { type: 'finish', reason: { kind: 'stop' } },
+      ],
+    },
+  ];
+  const { mock, im, teardown } = await setup(script);
+  try {
+    await mock.sendFromUser({ text: '跑一个任务' });
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('任务完成')), { label: 'result card', timeoutMs: 8000 });
+    const binding = im.map.get('mock', 'chat-1');
+    assert.ok(im.lastUserTexts.get(binding.sessionId), '应记录最后用户文本');
+    assert.equal(im.lastTurnFailed.get(binding.sessionId), undefined, '成功任务后失败标记应未设置');
+
+    // 成功任务后 /retry 必须被拒绝（此前会原样重跑任务，可能重复执行写操作）
+    await im.commandRetry({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' });
+    assert.ok(
+      mock.sent.some((m) => m.text?.includes('没有失败')),
+      '成功任务后 /retry 应明确拒绝',
+    );
+
+    // 失败 turn 后放行
+    im.notify.handleTurnEnd(binding, { reason: { kind: 'error' }, message: { content: [] } });
+    assert.equal(im.lastTurnFailed.get(binding.sessionId), true, '失败 turn 后应设置标记');
+    const followups = [];
+    const agent = im.ctx.agents.get(binding.sessionId);
+    const orig = agent.followup.bind(agent);
+    agent.followup = (m) => { followups.push(m); return orig(m); };
+    await im.commandRetry({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' });
+    assert.equal(followups.length, 1, '失败后 /retry 应重新提交任务');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：/log 宣布段数 = 实际段数，无二次切分（round-2 P2-5）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    const binding = im.map.get('mock', 'chat-1');
+
+    // 6546 字节输出（round-n1 实测样例量级）；给 mock 渠道临时声明 3000 字节上限
+    mock.maxMessageBytes = 3000;
+    const full = 'x'.repeat(6546);
+    im._lastFullOutput.set(binding.sessionId, full);
+
+    mock.reset();
+    await im.commandLog({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' });
+    // 等待所有分段发送完毕（无 sendFile 渠道 → 文本分段路径）
+    await waitFor(() => {
+      const body = mock.sent.filter((m) => m.text?.startsWith('('));
+      const announced = mock.sent.find((m) => m.text?.includes('完整输出共'));
+      const n = announced ? Number(announced.text.match(/共 (\d+) 段/)?.[1]) : 0;
+      return n > 0 && body.length === n;
+    }, { label: 'all segments sent', timeoutMs: 8000 });
+
+    const announced = mock.sent.find((m) => m.text?.includes('完整输出共'));
+    const n = Number(announced.text.match(/共 (\d+) 段/)[1]);
+    const body = mock.sent.filter((m) => m.text?.startsWith('('));
+    assert.equal(body.length, n, `宣布 ${n} 段，实发 ${body.length} 段（此前双重切分会 2N+1）`);
+    // 拼回必须无损
+    const joined = body.map((m) => m.text.replace(/^\(\d+\/\d+\) /, '')).join('');
+    assert.equal(joined, full, '分段拼回必须等于原文');
+    // 不再出现"回复 /log 取全文"的二次截断提示（round-n1 F15 回归）
+    assert.ok(
+      !mock.sent.some((m) => m.text?.includes('获取全文') && m.text?.includes('/log')),
+      '不得再提示用户用 /log 取全文（/log 自己就是全文路径）',
+    );
+  } finally {
+    delete mock.maxMessageBytes;
+    await teardown();
+  }
+});
+
+test('回归：/new 继承聊天级 /mute（round-2 P2-10）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    await im.commandMute({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, true);
+    assert.equal(im.map.get('mock', 'chat-1').muted, true);
+
+    // /new 重建绑定：此前 muted 字段随旧绑定丢失，通知立刻恢复
+    await mock.sendFromUser({ text: '/new' });
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('新会话已创建')), { label: '/new reply' });
+    const fresh = im.map.get('mock', 'chat-1');
+    assert.equal(fresh.muted, true, '/new 后聊天级 muted 必须保留');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：lastSeen 有界淘汰（round-2 P2-7）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    // 直接灌 510 个不同 chatId 的未授权消息：lastSeen 必须被压回上限
+    for (let i = 0; i < 510; i++) {
+      await mock.sendFromUser({
+        chatId: `spike-${i}`, userId: `spike-${i}`, userName: 'S', text: 'hi',
+      });
+    }
+    assert.ok(im.lastSeen.size <= 500, `lastSeen 超上限未淘汰：size=${im.lastSeen.size}`);
+    // 最近发言的 chat 仍在表里（淘汰的是最旧）
+    assert.ok(im.lastSeen.has(`mock:spike-509`), '最近聊天不得被淘汰');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：流式蓄水池有界（round-2 P2-8）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    const binding = im.map.get('mock', 'chat-1');
+    // 人离线 → 只蓄水不推送；灌 300KB 增量
+    const st = im.notify.state(binding.sessionId);
+    for (let i = 0; i < 300; i++) im.notify.appendStream(binding, 'z'.repeat(1024));
+    assert.ok(st.reservoir.length <= 256 * 1024, `蓄水池超限：${st.reservoir.length}`);
+  } finally {
+    await teardown();
+  }
+});
+
 test('派活 → 审批 → 放行 → 结果卡片（全链路）', async () => {
   const script = [
     {

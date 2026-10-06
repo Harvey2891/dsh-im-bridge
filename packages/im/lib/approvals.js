@@ -44,14 +44,17 @@ export class ApprovalManager {
     this._dispose = [];
     /** 最近已决记录（保留短暂窗口，供「已被响应」提示，FR-6.5） */
     this.recentDecisions = new Map();
+    /** 审批卡片推送的兜底超时（毫秒）：渠道发送卡死时按 fail-closed 处理（round-2 P1-2） */
+    this.sendTimeoutSec = 60;
   }
 
-  configure({ enabled, timeoutSec, pendingMaxSec, autoApproveRisk, riskRules }) {
+  configure({ enabled, timeoutSec, pendingMaxSec, autoApproveRisk, riskRules, sendTimeoutSec }) {
     this.enabled = enabled ?? true;
     this.timeoutSec = timeoutSec ?? 300;
     this.pendingMaxSec = pendingMaxSec ?? 3600;
     this.autoApproveRisk = autoApproveRisk ?? 'none';
     this.riskRules = riskRules ?? [];
+    this.sendTimeoutSec = sendTimeoutSec ?? 60;
   }
 
   /** 挂接 tools/pre-execute 门 + approval/request answerer。 */
@@ -73,6 +76,8 @@ export class ApprovalManager {
     for (const rec of this.records.values()) {
       clearTimeout(rec.timeoutTimer);
       clearTimeout(rec.pendingTimer);
+      clearTimeout(rec.sendTimeoutTimer);
+      if (rec.onAbort) rec.onAbort = null; // record 即将丢弃；AbortSignal 随请求结束
       rec.resolve('cancelled');
     }
     this.records.clear();
@@ -135,6 +140,8 @@ export class ApprovalManager {
       resolve: null,
       timeoutTimer: null,
       pendingTimer: null,
+      sendTimeoutTimer: null,
+      onAbort: null,
     };
     const outcome = new Promise((resolve) => {
       record.resolve = (value) => {
@@ -142,6 +149,10 @@ export class ApprovalManager {
         record.state = 'decided';
         clearTimeout(record.timeoutTimer);
         clearTimeout(record.pendingTimer);
+        clearTimeout(record.sendTimeoutTimer);
+        record.lastOutcome = value;
+        if (record.onAbort && req.signal) req.signal.removeEventListener('abort', record.onAbort);
+        record.onAbort = null;
         this.logLine({
           ts: new Date().toISOString(),
           approvalId,
@@ -172,11 +183,30 @@ export class ApprovalManager {
       record.resolve('cancelled');
       return outcome;
     }
-    req.signal?.addEventListener('abort', () => record.resolve('cancelled'), { once: true });
+    if (req.signal) {
+      // 🔴 决议时移除监听（round-2 P1-2）：{once:true} 只在触发时移除，
+      // 未触发就决议（如超时拒绝）会泄漏在 AbortSignal 上。
+      record.onAbort = () => record.resolve('cancelled');
+      req.signal.addEventListener('abort', record.onAbort);
+    }
+
+    // 🔴 推送看门狗（round-2 P1-2）：必须**先于** await send 武装——send 永不 settle
+    // （webhook 挂死）时，若武装在 send 之后则永远执行不到，审批状态机照样挂死。
+    // 只覆盖**发送阶段**（sendTimeoutSec 默认 60s）：发送 settle 即清除；
+    // 之后的用户等待窗口由 timeoutSec/pendingMaxSec 管理，看门狗不参与。
+    // 与 abort/用户决议共用 record.resolve 的已决守卫，先决者胜。
+    const cardText = `⏳ 审批 #${approvalId} 卡片推送超时，已按拒绝处理（可重新触发任务）。`;
+    record.sendTimeoutTimer = setTimeout(() => {
+      if (record.state !== 'waiting') return;
+      record.resolve('unavailable');
+      void this.send({ platform: binding.platform, chatId: binding.chatId }, { text: cardText })
+        .catch(() => {});
+    }, this.sendTimeoutSec * 1000);
 
     const card = this.renderCard(record);
     try {
       await this.send({ platform: binding.platform, chatId: binding.chatId }, card);
+      clearTimeout(record.sendTimeoutTimer); // 发送成功：看门狗使命完成（round-2 P1-2）
     } catch (err) {
       // 推送失败：不阻塞 agent——按 unavailable 处理（fail closed）
       record.resolve('unavailable');

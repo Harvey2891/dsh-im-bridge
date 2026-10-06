@@ -325,7 +325,7 @@ export class UserQuestionAnswerer {
    *        （**按钮路径**必须开：一次点击只携带一个 (q,o)，多问题卡片否则永远
    *        `invalid`、用户无法完成作答 —— round-2 发现 2）；文字命令路径则应答全，
    *        以便用户能明确表达"哪些题我不选"。
-   * @returns {'answered'|'not-found'|'invalid'|'forbidden'}
+   * @returns {'answered'|'incomplete'|'not-found'|'invalid'|'forbidden'}
    */
   respond(questionId, picks, custom, from, opts = {}) {
     const rec = this._find(questionId);
@@ -336,6 +336,10 @@ export class UserQuestionAnswerer {
     if (err) return err;
     // 文字命令路径要求答全（用户能明确表达"哪些题不选"）；按钮路径（accumulate）才允许部分
     if (!opts.allowPartial && !this._isComplete(rec)) return 'invalid';
+    // 🔴 含多选题的卡片**任何入口都不自动结题**（统一结题门，round-2 P1-1）：
+    // 多选"已有一项"≠"选完了"。此前只堵了 accumulate，`/answer <id> 1` 在单题多选卡
+    // 上仍一答即提交、第二项失效。多选卡必须显式 `done`（commitDraft）。
+    if (!this._mayAutoSettle(rec)) return 'incomplete';
     const answers = this._answersFromDraft(rec);
     const unanswered = answers.filter((a) => a.selected.length === 0 && !a.custom).length;
     return this._finish(rec, answers, {
@@ -365,7 +369,7 @@ export class UserQuestionAnswerer {
     const lastQ = picks.length ? picks[picks.length - 1].qIndex : 0;
     const label = rec.draft.get(lastQ)?.join('、') ?? '';
 
-    if (this._isComplete(rec) && !this._hasMultiSelect(rec)) {
+    if (this._isComplete(rec) && this._mayAutoSettle(rec)) {
       const r = this._finish(rec, this._answersFromDraft(rec), { accumulated: true });
       return { status: r, answered, total: rec.questions.length, label };
     }
@@ -390,6 +394,16 @@ export class UserQuestionAnswerer {
   }
 
   /**
+   * 统一结题门：这张卡片**允许**在答全后自动结算吗？
+   * 🔴 三个作答入口（respond / accumulate / answerText）必须共用这一个判定
+   * （round-2 P1-1：此前各入口各带各的条件，多选卡在 respond/answerText
+   * 路径仍会提前结题）。含多选题 ⇒ 只能由 `done`（commitDraft）显式结算。
+   */
+  _mayAutoSettle(rec) {
+    return !this._hasMultiSelect(rec);
+  }
+
+  /**
    * 自由文本作答：填入**第一道尚未作答的自由文本题**。
    *
    * 混合题型（部分题有选项、部分是自由文本）必须走这条路径才能完成：
@@ -411,12 +425,12 @@ export class UserQuestionAnswerer {
     if (err) return { status: err };
 
     const remainingText = this._textQs(rec).filter((qi) => !rec.draftCustom.has(qi)).length;
-    if (this._isComplete(rec)) {
+    if (this._isComplete(rec) && this._mayAutoSettle(rec)) {
       const r = this._finish(rec, this._answersFromDraft(rec), { text: true });
       return { status: r, qi: target, remainingText: 0 };
     }
     this.logLine(`question #${rec.id} text-filled q${target + 1}, remaining text=${remainingText}`);
-    return { status: 'partial', qi: target, remainingText };
+    return { status: 'partial', qi: target, remainingText, needsDone: this._hasMultiSelect(rec) };
   }
 
   /** 用草稿（选项 + 自由文本）组装答案；未答的题保持空。 */

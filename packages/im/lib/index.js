@@ -116,6 +116,9 @@ export class ImRuntime extends Service {
     // 供出站取平台 userId，同时**不**创建会话绑定（避免绕过 autoCreate/maxSessions，F10）
     this.lastSeen = new Map();
     this.agentHandles = new Map(); // sessionId → AgentHandle（释放 agent 的唯一途径）
+    // sessionId → 最近 turn 是否失败：/retry 只在**失败后**放行（round-2 P2-6）。
+    // 此前 /retry 无条件重放 lastUserTexts，成功任务后也会把（可能带写操作的）任务再跑一遍。
+    this.lastTurnFailed = new Map();
     this.log = ctx.logger('im');
     this._dispose = [];
     this._ready = this.init();
@@ -193,6 +196,10 @@ export class ImRuntime extends Service {
       streamWhileOnline: cfg.notifications.streamWhileOnline,
       onlineWindowMin: cfg.notifications.onlineWindowMin,
       flushIntervalMs: cfg.notifications.flushIntervalMs,
+      markTurnFailed: (sessionId, failed) => {
+        if (failed) this.lastTurnFailed.set(sessionId, true);
+        else this.lastTurnFailed.delete(sessionId);
+      },
     });
     this.notify.mount();
 
@@ -418,11 +425,21 @@ export class ImRuntime extends Service {
     // `autoCreate=false` 与 `maxSessions` 两道保护（round-n1 F10 —— 未授权聊天
     // 也会先占一个绑定名额，授权用户的 `/new` 可能被上限阻断）。
     // 改为核心自持一张轻量「最近发言者」表，与正式会话绑定解耦。
-    this.lastSeen.set(chatKey(platform, chatId), {
+    const key = chatKey(platform, chatId);
+    // 🔴 必须有界（round-2 P2-7）：此前无上限，未授权用户可用不同 chatId 无限撑大。
+    // 刷新前先删后插以保持"最近"在 Map 尾部；超限淘汰最旧（头部）。
+    this.lastSeen.delete(key);
+    this.lastSeen.set(key, {
       userId: String(userId),
       userName: msg.userName,
       at: Date.now(),
     });
+    if (this.lastSeen.size > 500) {
+      for (const oldKey of this.lastSeen.keys()) {
+        this.lastSeen.delete(oldKey);
+        if (this.lastSeen.size <= 400) break;
+      }
+    }
     // 已有绑定时照旧刷新（在线判定与 users 列表仍依赖它）
     this.map.touch(platform, chatId, userId, msg.userName);
 
@@ -586,6 +603,11 @@ export class ImRuntime extends Service {
         }
         const text = this.lastUserTexts.get(sessionId);
         if (!text) return reply('ℹ️ 没有可重试的任务。');
+        // 🔴 与 /retry 命令同一门（round-2 P2-6）：只有最近一次 turn 失败才可重试，
+        // 否则旧按钮会把成功任务再跑一遍。
+        if (!this.lastTurnFailed.get(sessionId)) {
+          return reply('ℹ️ 最近一次任务没有失败，无需重试。');
+        }
         const agent = this.ctx.agents.get(sessionId);
         if (!agent) return reply('ℹ️ 会话不在线（重启后需先发一条消息恢复）。');
         agent.followup(this.userMessage(text));
@@ -943,6 +965,10 @@ export class ImRuntime extends Service {
     const { platform, chatId, userId } = msg;
     const cfg = this.cfg.security;
     const existing = this.map.get(platform, chatId);
+    // 🔴 /new 不能丢掉聊天级的 /mute（round-2 P2-10）：muted 存于绑定对象，
+    // remove+create 会连带清掉 ⇒ 用户"本聊天已静默"的状态被一个 /new 悄悄撤销。
+    // 先记住旧值，重建绑定后继承回去。
+    const inheritedMuted = existing?.muted === true ? existing.mutedBy ?? '' : null;
     if (existing) {
       // 旧会话释放（历史日志保留在磁盘，/resume v2 可恢复）
       const oldAgent = this.ctx.agents.get(existing.sessionId);
@@ -966,6 +992,11 @@ export class ImRuntime extends Service {
     // create 仍会抛 `session "<id>" already exists`。
     const newSessionId = this.freshSessionId(platform, chatId);
     const binding = this.createBinding(platform, chatId, msg.chatType ?? 'private', newSessionId);
+    if (inheritedMuted !== null) {
+      binding.muted = true;
+      binding.mutedBy = inheritedMuted;
+      await this.map.save();
+    }
     await this.createAgent(binding.sessionId);
     await this.send({ platform, chatId }, {
       text: `✅ 新会话已创建（${binding.sessionId}）。\n直接发送任务即可，例如：\n> 跑一下 tests 目录的 pytest`,
@@ -1019,10 +1050,16 @@ export class ImRuntime extends Service {
     // 无 sendFile 的渠道：长文本分段发送。
     // 🔴 不能限 `maxChunks`：那会让 `/log` 只发前几段，而截断提示又写着"用 /log 取全文"
     // —— 而 /log 正是这条路，用户**永远拿不到全文**（round-n1 F15）。
-    // 这里按字节预算切分并**全量**发送，不设段数上限。
+    // 🔴 直接 `_dispatch`，不再经 `send()` 二次切分（round-2 P2-5）：
+    // 此前预切 N 段后加 `(i/N)` 前缀再走 send()，前缀把每段重新推回预算边缘，
+    // send() 又把它们各切成两条 —— 宣布 3 段实发 6 条、双层序号。
+    // 这里把前缀计入预算（-16 字节），保证每段 ≤ 渠道上限，一次投递一段。
     const maxBytes = this.channels.get(msg.platform)?.maxMessageBytes ?? 3500;
-    const chunks = splitByBytes(markdownToText(full), maxBytes);
+    const chunks = splitByBytes(markdownToText(full), Math.max(1, maxBytes - 16));
     const total = chunks.length;
+    if (total === 0) {
+      return this.send({ platform: msg.platform, chatId: msg.chatId }, { text: 'ℹ️ 完整输出为空。' });
+    }
     if (total > 1) {
       await this.send({ platform: msg.platform, chatId: msg.chatId }, {
         text: `📜 完整输出共 ${total} 段，正在全部发送…`,
@@ -1030,7 +1067,17 @@ export class ImRuntime extends Service {
     }
     for (let i = 0; i < total; i++) {
       const seq = total > 1 ? `(${i + 1}/${total}) ` : '';
-      await this.send({ platform: msg.platform, chatId: msg.chatId }, { text: `${seq}${chunks[i]}` });
+      const text = `${seq}${chunks[i]}`;
+      if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+        // 防御：前缀+正文仍超限（单行无切分点等极端情况）→ 明确失败，不静默截断
+        await this.send({ platform: msg.platform, chatId: msg.chatId }, {
+          text: `⚠️ 第 ${i + 1}/${total} 段单行超出渠道上限（${maxBytes} 字节），无法完整投递。请让 agent 分段输出或缩短输出。`,
+        });
+        return;
+      }
+      await this._dispatch(this.channels.get(msg.platform), {
+        platform: msg.platform, chatId: msg.chatId, text,
+      });
     }
   }
 
@@ -1039,9 +1086,12 @@ export class ImRuntime extends Service {
   }
 
   /**
-   * `/retry`：重试本会话最近一次失败的任务。
+   * `/retry`：重试本会话**最近一次失败**的任务。
    * 与错误卡片上的 `retry:<sessionId>` 按钮等价，供无内联按钮的渠道（钉钉）使用。
    * 权限与归属由命令门（perm: 'user'）与本会话绑定共同保证。
+   * 🔴 只在上一 turn **真的失败**时放行（round-2 P2-6）：lastTurnFailed 由
+   * NotifyBus 在 turn/end 时按 status 维护，成功任务后该标记清除 —— 否则用户
+   * 在成功任务后发 /retry 会把（可能带写操作的）任务原样重跑。
    */
   async commandRetry(msg) {
     const chat = { platform: msg.platform, chatId: msg.chatId };
@@ -1049,6 +1099,9 @@ export class ImRuntime extends Service {
     if (!binding) return this.send(chat, { text: 'ℹ️ 尚未创建会话。' });
     const text = this.lastUserTexts.get(binding.sessionId);
     if (!text) return this.send(chat, { text: 'ℹ️ 没有可重试的任务。' });
+    if (!this.lastTurnFailed.get(binding.sessionId)) {
+      return this.send(chat, { text: 'ℹ️ 最近一次任务没有失败，无需重试。（失败后可用 /retry 重跑同一任务）' });
+    }
     const agent = this.ctx.agents.get(binding.sessionId);
     if (!agent) return this.send(chat, { text: 'ℹ️ 会话不在线（重启后需先发一条消息恢复）。' });
     agent.followup(this.userMessage(text));
@@ -1159,7 +1212,13 @@ export class ImRuntime extends Service {
       const r = this.userQuestions.answerText(String(id), content, { platform: msg.platform, chatId: msg.chatId });
       const t = {
         answered: `✅ 已回答提问 #${id} 的文字题，agent 继续。`,
-        partial: `📝 已记录提问 #${id} 第 ${(r.qi ?? 0) + 1} 题的文字；还有 ${r.remainingText} 道文字题未答。`,
+        // 🔴 回执必须同时反映两种"未结题"原因（round-2 P1-1 连带）：
+        // 还有文字题未答 / 含多选题需显式 done。单一口径会误导用户。
+        partial: `📝 ${[
+          `已记录提问 #${id} 第 ${(r.qi ?? 0) + 1} 题的文字`,
+          ...(r.remainingText > 0 ? [`还有 ${r.remainingText} 道文字题未答`] : []),
+          ...(r.needsDone ? [`该卡片含**多选题**，完成后请发 \`/answer ${id} done\` 提交`] : []),
+        ].join('；')}。`,
         continued: `✅ 已回答提问 #${id}（此前已超时挂起，答案已转交 agent）。`,
         invalid: r.reason === 'no-text-question'
           ? '⚠️ 该提问没有自由文本题，请用编号作答。'
@@ -1212,6 +1271,9 @@ export class ImRuntime extends Service {
     const texts = {
       answered: `✅ 已回答提问 #${id}，agent 继续。`,
       'not-found': `ℹ️ 提问 #${id} 不存在、已回答或已超时。`,
+      // 🔴 多选卡"答全也不自动结题"（统一结题门，round-2 P1-1）：
+      // 草稿已记录，必须显式 done 提交（多选"已有一项"≠"选完了"）。
+      incomplete: `📝 已记录选择——该卡片含**多选题**，请继续作答后发 \`/answer ${id} done\` 提交。`,
       invalid: rec.questions.some((q) => !(q.options ?? []).length)
         // 卡片含自由文本题：文字题必须用显式语法，编号只能答选项题
         ? `⚠️ 还没答完——该卡片含**自由文本题**，请用 \`/answer ${id} text <内容>\` 回答文字题，或发 \`/answer ${id} done\` 提交当前选择。`
