@@ -272,19 +272,31 @@ export class UserQuestionAnswerer {
     const hasOptions = record.questions.some((q) => (q.options ?? []).length);
     const hasText = record.questions.some((q) => !(q.options ?? []).length);
     const mixed = hasOptions && hasText;
-    // 🔴 示例按题型/选择数输出（新计轮 round-4 P2-1）：
-    // ① 单选卡**不得**出现"逗号分隔，如 1,3"——照抄会被 `n>1 && !multiSelect` 拒绝（invalid）；
-    // ② 多题卡必须引导点号格式（裸编号在多题解析下全部映射第 1 题）。
-    const anyMulti = record.questions.some((q) => q.multiSelect === true);
-    const multiExample = anyMulti
-      ? (record.questions.length > 1 ? '；多选逗号分隔，如 `1.2,1.3`' : '；多选逗号分隔，如 `1,3`')
+    // 🔴 示例必须**从卡片实际题目派生**（新计轮 round-4 P2-1 → round-5 P2）：
+    // ① 单选票卡**不得**出现"逗号分隔，如 1,3"——照抄会被 `n>1 && !multiSelect` 拒绝（invalid）；
+    // ② 多题卡必须引导点号格式（裸编号在多题解析下全部映射第 1 题）；
+    // ③ 示例的题号/选项号必须**真实存在**——硬编码 `1.2`/`1.2,1.3` 在第 1 题
+    //    是文字题（越界 invalid）或单选（同题多 pick invalid）时误导用户。
+    const isMultiQ = record.questions.length > 1;
+    const firstOptQi = record.questions.findIndex((q) => (q.options ?? []).length > 0);
+    // 第一个**有 ≥2 个选项**的多选题（逗号示例需要两个真实选项号）
+    const firstMultiQi = record.questions.findIndex(
+      (q) => q.multiSelect === true && (q.options ?? []).length >= 2,
+    );
+    const optExample = isMultiQ
+      ? `${firstOptQi + 1}.1`
+      : ((record.questions[firstOptQi]?.options ?? []).length >= 2 ? '2' : '1');
+    const multiExample = firstMultiQi >= 0
+      ? (isMultiQ
+        ? `；多选逗号分隔，如 \`${firstMultiQi + 1}.1,${firstMultiQi + 1}.2\``
+        : '；多选逗号分隔，如 `1,2`')
       : '';
     lines.push(
       '',
       hasOptions
-        ? (record.questions.length > 1
-          ? `选项题：**直接回"题号.选项号"**（如 \`1.2\`${multiExample}），或发 \`/answer ${record.id} 1.2\`。`
-          : `选项题：**直接回数字**即可（如 \`2\`${multiExample}），或发 \`/answer ${record.id} 2\`。`)
+        ? (isMultiQ
+          ? `选项题：**直接回"题号.选项号"**（如 \`${optExample}\`${multiExample}），或发 \`/answer ${record.id} ${optExample}\`。`
+          : `选项题：**直接回数字**即可（如 \`${optExample}\`${multiExample}），或发 \`/answer ${record.id} ${optExample}\`。`)
         : '',
       hasText
         ? (mixed
@@ -297,13 +309,13 @@ export class UserQuestionAnswerer {
       // 🔴 多选判定必须**优先于**多题分支（新计轮 round-2 P2-1）：多题卡里只要有一题
       // multiSelect，统一结题门（_mayAutoSettle）就禁止自动提交——旧版多题分支无条件
       // 写"答全会自动提交"，对含多选的卡是错误承诺：用户答完会停在 partial（操作无效）。
-      // 🔴 两处口径与结题门一致（新计轮 round-3）：① 判定用 `=== true`（同 _hasMultiSelect）；
-      // ② 多题示例必须用"题号.选项号"——多题解析下裸 `1,3` 全部映射到第 1 题
-      // （index.js commandAnswer），第 1 题单选时照抄示例会返回 invalid。
+      // 🔴 口径与结题门一致（新计轮 round-3）：判定用 `=== true`（同 _hasMultiSelect）。
+      // 🔴 示例同样从实际题目派生（round-5 P2）：硬编码 2.1,2.3 / 1,3 在
+      // 多选题只有 1 个选项或位于其他题号时误导用户。
       record.questions.some((q) => q.multiSelect === true)
         ? (record.questions.length > 1
-          ? `本卡含**多选题**：按钮可逐题点选，但选完**不会自动提交**——请发 \`/answer ${record.id} done\` 提交（多选题编号用"题号.选项号"，如 \`2.1,2.3\`）。`
-          : `本卡含**多选题**：**不会自动提交**——选完请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔，如 \`1,3\`）。`)
+          ? `本卡含**多选题**：按钮可逐题点选，但选完**不会自动提交**——请发 \`/answer ${record.id} done\` 提交${firstMultiQi >= 0 ? `（多选编号用"题号.选项号"，如 \`${firstMultiQi + 1}.1,${firstMultiQi + 1}.2\`）` : '（多选编号用"题号.选项号"）'}`
+          : `本卡含**多选题**：**不会自动提交**——选完请发 \`/answer ${record.id} done\` 提交（多选可一次逗号分隔${firstMultiQi >= 0 ? '，如 `1,2`' : ''}）。`)
         : record.questions.length > 1
           ? `按钮可逐题点选：答全会自动提交；也可发 \`/answer ${record.id} done\` 提前提交（未答的题按跳过）。`
           : '',

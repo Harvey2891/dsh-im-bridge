@@ -435,9 +435,63 @@ test('回归：多题卡含多选不得承诺"答全自动提交"（round-2 P2-1
   assert.ok(!card.text.includes('答全会自动提交'), '含多选的多题卡不得承诺"答全会自动提交"');
   assert.ok(card.text.includes('不会自动提交'), '应明确"不会自动提交"');
   assert.ok(card.text.includes('/answer'), '应给出 done 提交命令');
-  // 🔴 多题示例必须用"题号.选项号"（round-3 P2）：裸 `1,3` 在多题解析下
-  // 全部映射到第 1 题，第 1 题单选时照抄示例会返回 invalid。
-  assert.ok(card.text.includes('2.1,2.3'), '多题多选的编号示例必须是点号格式（如 2.1,2.3）');
+  // 🔴 多题示例必须用"题号.选项号"，且从实际题目派生（round-3 P2 → round-5 P2）：
+  // 裸 `1,3` 在多题解析下全部映射到第 1 题；硬编码 2.1,2.3 在 q2 只有 2 个选项时越界。
+  assert.ok(card.text.includes('2.1,2.2'), '多题多选的编号示例必须取自实际多选题（如 2.1,2.2）');
+});
+
+test('回归：多题卡示例取自实际题目，照抄不得 invalid（round-5 P2）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?（多选）', options: [{ label: 'b1' }, { label: 'b2' }, { label: 'b3' }], multiSelect: true },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+
+  // 提取卡片里的多选逗号示例，按用户视角解析（点号 → qIndex/oIndex）后照抄提交
+  const m = card.text.match(/多选逗号分隔，如 `(\d+\.\d+,\d+\.\d+)`/);
+  assert.ok(m, '多题多选的"选项题"行应给出点号逗号示例');
+  const picks = m[1].split(',').map((t) => {
+    const [q, o] = t.split('.').map(Number);
+    return { qIndex: q - 1, oIndex: o - 1 };
+  });
+  const r = a.accumulate('01', picks, { platform: 'mock', chatId: 'c1' });
+  assert.notEqual(r.status, 'invalid', `照抄多选示例不得 invalid（实际: ${r.status}）`);
+
+  // 单个示例（"选项题"行首个点号示例）同样照抄不得 invalid
+  const s = card.text.match(/如 `(\d+\.\d+)`/);
+  assert.ok(s, '"选项题"行应给出单个点号示例');
+  const [sq, so] = s[1].split('.').map(Number);
+  const r2 = a.accumulate('01', [{ qIndex: sq - 1, oIndex: so - 1 }], { platform: 'mock', chatId: 'c1' });
+  assert.notEqual(r2.status, 'invalid', `照抄单示例不得 invalid（实际: ${r2.status}）`);
+});
+
+test('回归：第 1 题为文字题时选项示例必须指向真实选项题（round-5 P2）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: '叫什么名字？' }, // 文字题，无选项
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+  const m = card.text.match(/如 `(\d+)\.(\d+)`/);
+  assert.ok(m, '多题卡应有点号示例');
+  assert.equal(Number(m[1]), 2, '第 1 题是文字题：示例必须指向第 2 题（照抄 1.x 会越界 invalid）');
 });
 
 test('回归：单选票卡不得出现逗号多选示例（round-4 P2-1）', async () => {
