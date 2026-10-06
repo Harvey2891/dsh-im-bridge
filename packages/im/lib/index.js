@@ -318,30 +318,36 @@ export class ImRuntime extends Service {
     const total = parts.length + (cmdOwnSegment ? 1 : 0);
 
     let last;
-    // 带按钮的原生渠道（未声明 buttonsAsText）：按钮**只在整体最后一条**消息上。
-    // 每段都带会让用户点击前面那些已失效的按钮（返回 not-found），是无效操作。
-    const lastBodyIdx = cmdOwnSegment ? -1 : parts.length - 1;
+    // 附件与按钮都必须**恰好投递一次**，且都在整体最后一条消息上。
+    // 🔴 此前文本型渠道（cmdOwnSegment=true）时 lastBodyIdx=-1 使每段都清附件，
+    // 命令末段也清 —— 结果**没有任何一次**携带附件，附件静默消失（round-n1 F03）。
+    // 按钮只出现在末段：每段都带会让用户点到已失效的按钮（返回 not-found）。
+    const carried = body.buttons?.length ? 'buttons' : (body.attachments?.length ? 'attachments' : null);
+    const lastDispatchIdx = cmdOwnSegment ? total - 1 : parts.length - 1;
+    let dispatchIdx = -1;
     for (let i = 0; i < parts.length; i++) {
-      const isLastBody = i === lastBodyIdx;
+      dispatchIdx += 1;
+      const isLastDispatch = dispatchIdx === lastDispatchIdx;
       last = await this._dispatch(channel, {
         ...body,
         text: `(${i + 1}/${total}) ${parts[i]}`,
-        // 按钮与附件都只在最后一段：附件每段都带会被重复投递
-        ...(isLastBody ? {} : { buttons: undefined, attachments: undefined }),
+        ...(isLastDispatch ? {} : { buttons: undefined, attachments: undefined }),
       });
     }
     if (cmdOwnSegment) {
       const cmdParts = splitByBytes(commands, Math.max(1, maxBytes - reserve));
       for (let j = 0; j < cmdParts.length; j++) {
-        const idx = parts.length + j + 1;
-        const isVeryLast = j === cmdParts.length - 1;
+        dispatchIdx += 1;
+        const isLastDispatch = dispatchIdx === lastDispatchIdx;
         last = await this._dispatch(channel, {
           ...body,
-          text: `(${idx}/${total}) ${cmdParts[j]}`,
-          ...(isVeryLast ? { attachments: undefined } : { buttons: undefined, attachments: undefined }),
+          text: `(${parts.length + j + 1}/${total}) ${cmdParts[j]}`,
+          ...(isLastDispatch ? {} : { buttons: undefined, attachments: undefined }),
         });
       }
     }
+    // 若最后一条本应携带按钮/附件却没有对应字段，属调用方问题；这里不额外补救。
+    void carried;
     return last;
   }
 
@@ -510,10 +516,18 @@ export class ImRuntime extends Service {
           'not-found': `ℹ️ 提问 #${qid} 不存在、已回答或已超时。`,
           invalid: `⚠️ 选项无效，提问仍在等待——请按卡片编号重发。`,
           forbidden: `⛔ 该提问属于其它会话，不能在此代答。`,
+          // 🔴 按钮路径同样可能落到 continued 三种收尾（round-n1 F16：此前未映射，
+          // 用户会看到内部状态名甚至误以为成功）
+          continued: `✅ 已回答提问 #${qid}（此前已超时挂起，答案已转交 agent）。`,
+          'no-continuation': '⚠️ 该提问已超时挂起，当前无法转交答案——请让 agent 重新提问。',
+          'delivery-error': '⚠️ 答案转交失败（不是你的操作问题），请稍后重试。',
         };
         if (acc.status === 'partial') {
+          // 🔴 混合题型的文字题必须用**显式**语法：普通文字在该卡里会按新任务处理，
+          // 这里若仍写"请直接回复文字"会把用户导向错误入口（round-n1 F09）。
           const hint = acc.needsText
-            ? `\n该卡片含**自由文本题**，按钮无法作答——请直接回复文字，或发 \`/answer ${qid} done\` 提交当前选择。`
+            ? `\n该卡片含**自由文本题**，按钮无法作答——请发 \`/answer ${qid} text <内容>\` 回答文字题，`
+              + `或发 \`/answer ${qid} done\` 提交当前选择。`
             : `\n进度 ${acc.answered}/${acc.total}——继续点其余题，或发 \`/answer ${qid} done\` 直接提交。`;
           return reply(
             `📝 已记录提问 #${qid} 的第 ${(Number(qIdxRaw) || 0) + 1} 题：${acc.label ?? ''}${hint}`,
@@ -534,6 +548,16 @@ export class ImRuntime extends Service {
       }
       case 'retry': {
         const sessionId = parts.slice(1).join(':');
+        // 🔴 与 approve/q 一致：回调必须过身份校验。此前 retry 分支**没有任何**权限检查，
+        // 被 `/revoke` 撤销的用户仍能点旧按钮重新派活（round-n1 F01）。
+        if (!this.isAllowed(platform, userId)) {
+          return reply(`⛔ 无权限：重试需要 allowlist 成员身份（当前 ${platform}:${userId} 未授权）。`);
+        }
+        // 归属校验：只能重试**本聊天**的会话，避免用别的会话的回调指定目标 session
+        const binding = this.map.get(platform, chatId);
+        if (!binding || binding.sessionId !== sessionId) {
+          return reply('⛔ 该重试按钮不属于本会话。');
+        }
         const text = this.lastUserTexts.get(sessionId);
         if (!text) return reply('ℹ️ 没有可重试的任务。');
         const agent = this.ctx.agents.get(sessionId);

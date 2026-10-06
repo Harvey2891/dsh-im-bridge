@@ -462,35 +462,50 @@ export class UserQuestionAnswerer {
    * @returns {string|null} 错误码；null 表示已合并
    */
   _merge(rec, { picks = [], text } = {}) {
-    // 单选题目在同一次调用里给了多个选择 → 拒绝（`/answer 01 1,2` 应报错，
-    // 不能静默"最后一个生效"）。按钮路径每次只带一个 pick，不受影响。
+    // 🔴 **先全量校验、再原子写入**：此前边校验边写，后面的 pick 越界时前面的选择
+    // 已经落进草稿 —— 用户看到"被拒绝"，却已经改动了状态，之后可能带着这部分
+    // 被拒绝的答案结题（round-n1 F04）。
     const perQ = new Map();
-    for (const p of picks) perQ.set(p.qIndex, (perQ.get(p.qIndex) ?? 0) + 1);
-    for (const [qi, n] of perQ) {
-      if (n > 1 && !rec.questions[qi]?.multiSelect) return 'invalid';
-    }
     for (const p of picks) {
       if (!Number.isInteger(p.qIndex) || p.qIndex < 0 || p.qIndex >= rec.questions.length) return 'invalid';
       const opts = rec.questions[p.qIndex].options ?? [];
       if (!Number.isInteger(p.oIndex) || p.oIndex < 0 || p.oIndex >= opts.length) return 'invalid';
-      if (!rec.questions[p.qIndex].multiSelect) rec.draft.set(p.qIndex, []);
-      if (!rec.draft.has(p.qIndex)) rec.draft.set(p.qIndex, []);
-      const label = opts[p.oIndex].label;
-      if (!rec.draft.get(p.qIndex).includes(label)) rec.draft.get(p.qIndex).push(label);
+      perQ.set(p.qIndex, (perQ.get(p.qIndex) ?? 0) + 1);
     }
+    // 单选题目在同一次调用里给了多个选择 → 拒绝（`/answer 01 1,2` 应报错，
+    // 不能静默"最后一个生效"）。按钮路径每次只带一个 pick，不受影响。
+    for (const [qi, n] of perQ) {
+      if (n > 1 && !rec.questions[qi].multiSelect) return 'invalid';
+    }
+    let textTarget;
     if (text != null) {
       const t = String(text).trim();
       if (!t) return 'invalid';
       const textQs = this._textQs(rec);
       if (textQs.length > 0) {
-        const target = textQs.find((qi) => !rec.draftCustom.has(qi));
-        if (target === undefined) return 'invalid';
-        rec.draftCustom.set(target, t);
+        textTarget = textQs.find((qi) => !rec.draftCustom.has(qi));
+        if (textTarget === undefined) return 'invalid';
       } else {
-        const target = [...rec.draft.keys()].sort((a, b) => a - b)[0];
-        if (target === undefined) return 'invalid';
-        rec.draftCustom.set(target, t);
+        // 整张卡片没有文字题 → 文字作为**附言**挂在某个选项题上（`/answer <id> 2 附言` 的旧语义）。
+        // 🔴 必须同时看本次 picks：原子化后"先校验后写入"，此时 draft 还没更新，
+        // 只看 draft 会取不到目标而误报 invalid（自测踩到）。
+        const fromPicks = picks.map((p) => p.qIndex).sort((a, b) => a - b)[0];
+        const fromDraft = [...rec.draft.keys()].sort((a, b) => a - b)[0];
+        textTarget = fromPicks ?? fromDraft;
+        if (textTarget === undefined) return 'invalid';
       }
+    }
+
+    // —— 校验全过，开始写入 ——
+    for (const p of picks) {
+      const opts = rec.questions[p.qIndex].options ?? [];
+      if (!rec.questions[p.qIndex].multiSelect) rec.draft.set(p.qIndex, []);
+      if (!rec.draft.has(p.qIndex)) rec.draft.set(p.qIndex, []);
+      const label = opts[p.oIndex].label;
+      if (!rec.draft.get(p.qIndex).includes(label)) rec.draft.get(p.qIndex).push(label);
+    }
+    if (text != null && textTarget !== undefined) {
+      rec.draftCustom.set(textTarget, String(text).trim());
     }
     return null;
   }

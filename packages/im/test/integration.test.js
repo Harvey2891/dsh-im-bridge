@@ -722,6 +722,91 @@ test('回归：原生按钮渠道分段时按钮只出现在最后一段', async
   }
 });
 
+test('回归：文本按钮渠道分段时附件不得丢失（恰好投递一次）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    mock.maxMessageBytes = 300;
+    mock.buttonsAsText = true;   // 文本型渠道：核心把按钮渲染进正文、命令块独占末段
+    await im.send({ platform: 'mock', chatId: 'chat-1' }, {
+      text: 'x'.repeat(1200),
+      buttons: [{ id: 'a:1', label: '批准', command: '/approve a yes' }],
+      attachments: [{ kind: 'file', name: 'r.txt', text: '附件内容' }],
+    });
+    const withAtt = mock.sent.filter((m) => m.attachments?.length);
+    // round-n1 F03：此前 lastBodyIdx=-1 让每段都清附件，命令末段也清 ⇒ 附件全丢
+    assert.equal(withAtt.length, 1, '附件必须恰好投递一次');
+    assert.equal(withAtt[0], mock.sent[mock.sent.length - 1], '必须挂在整体最后一条');
+    // 文本型渠道：按钮已被核心渲染进正文（单一真源），不会再有 buttons 字段；
+    // 渲染出的命令必须恰好出现一次
+    assert.equal(mock.sent.filter((m) => m.buttons?.length).length, 0, '文本渠道不应再带 buttons 字段');
+    const rendered = mock.sent.map((m) => m.text ?? '').join('\n');
+    assert.equal(rendered.split('/approve a yes').length - 1, 1, '命令必须恰好渲染一次');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：被拒绝的作答不得污染草稿（原子合并）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+      { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+    ]);
+    const from = { platform: 'mock', chatId: 'chat-1', userId: 'user-1' };
+
+    // 第二题越界 → 整批拒绝，第一题也不得被写入（round-n1 F04）
+    await im.commandAnswer(from, [qid, '1.1,2.99']);
+    const rec = im.userQuestions.records.get(qid);
+    assert.equal(rec.draft.size, 0, '被拒绝的请求不得留下任何草稿');
+
+    // 随后正常答两题即可完成（若草稿被污染，这里会带上被拒绝的答案）
+    await im.commandAnswer(from, [qid, '1.2,2.1']);
+    const ans = await p;
+    assert.deepEqual(ans.answers, [
+      { id: 'q1', selected: ['a2'] },
+      { id: 'q2', selected: ['b1'] },
+    ]);
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：retry 回调必须过权限与归属校验', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+    const sessionId = im.map.get('mock', 'chat-1').sessionId;
+
+    // 别的聊天（同平台）用本会话的 id 发起 retry → 必须被拒
+    await im.handleCallback({
+      platform: 'mock', chatId: 'other-chat', userId: 'user-1', userName: 'Tester',
+      data: `retry:${sessionId}`,
+    });
+    assert.ok(
+      mock.sent.some((m) => m.text?.includes('不属于本会话')),
+      '跨会话 retry 必须被拒（round-n1 F01）',
+    );
+
+    // 未授权用户 → 必须被拒
+    mock.reset();
+    await im.handleCallback({
+      platform: 'mock', chatId: 'chat-1', userId: 'stranger', userName: 'X',
+      data: `retry:${sessionId}`,
+    });
+    assert.ok(
+      mock.sent.some((m) => m.text?.includes('无权限')),
+      '未授权用户 retry 必须被拒',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
 test('派活 → 审批 → 放行 → 结果卡片（全链路）', async () => {
   const script = [
     {
