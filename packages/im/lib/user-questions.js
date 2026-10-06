@@ -249,7 +249,7 @@ export class UserQuestionAnswerer {
       else lines.push('', q.question);
       if (q.header) lines.push(`_${q.header}_`);
       if (q.detail) lines.push(q.detail);
-      if (q.multiSelect) lines.push('（可多选）');
+      if (q.multiSelect === true) lines.push('（可多选）');
 
       const opts = q.options ?? [];
       opts.forEach((o, oi) => {
@@ -272,10 +272,19 @@ export class UserQuestionAnswerer {
     const hasOptions = record.questions.some((q) => (q.options ?? []).length);
     const hasText = record.questions.some((q) => !(q.options ?? []).length);
     const mixed = hasOptions && hasText;
+    // 🔴 示例按题型/选择数输出（新计轮 round-4 P2-1）：
+    // ① 单选卡**不得**出现"逗号分隔，如 1,3"——照抄会被 `n>1 && !multiSelect` 拒绝（invalid）；
+    // ② 多题卡必须引导点号格式（裸编号在多题解析下全部映射第 1 题）。
+    const anyMulti = record.questions.some((q) => q.multiSelect === true);
+    const multiExample = anyMulti
+      ? (record.questions.length > 1 ? '；多选逗号分隔，如 `1.2,1.3`' : '；多选逗号分隔，如 `1,3`')
+      : '';
     lines.push(
       '',
       hasOptions
-        ? `选项题：**直接回数字**即可（如 \`2\`；多选逗号分隔，如 \`1,3\`），或发 \`/answer ${record.id} 2\`。`
+        ? (record.questions.length > 1
+          ? `选项题：**直接回"题号.选项号"**（如 \`1.2\`${multiExample}），或发 \`/answer ${record.id} 1.2\`。`
+          : `选项题：**直接回数字**即可（如 \`2\`${multiExample}），或发 \`/answer ${record.id} 2\`。`)
         : '',
       hasText
         ? (mixed

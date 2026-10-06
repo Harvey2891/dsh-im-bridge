@@ -1194,6 +1194,54 @@ test('回归：并发替换后 /new 失败回滚不得误删他人绑定（round
   }
 });
 
+test('回归：/new 双击合并处理（同聊天串行化，round-4 P2-2）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => mock.sent.some((m) => m.text?.includes('任务完成')), { label: 'result card', timeoutMs: 8000 });
+
+    // 放慢 disposeAgent，强制两个并发 /new 交错（旧版：后者 map.remove 误删前者的新绑定）
+    const origDispose = im.disposeAgent.bind(im);
+    let slowed = false;
+    im.disposeAgent = async (sid) => {
+      if (!slowed) { slowed = true; await new Promise((r) => setTimeout(r, 50)); }
+      return origDispose(sid);
+    };
+    // 计数 createAgent：双击不得建两个 agent
+    let creates = 0;
+    const origCreate = im.createAgent.bind(im);
+    im.createAgent = async (...args) => { creates++; return origCreate(...args); };
+    try {
+      await Promise.all([
+        im.commandNew({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }),
+        im.commandNew({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }),
+      ]);
+    } finally {
+      im.disposeAgent = origDispose;
+      im.createAgent = origCreate;
+    }
+
+    const b = im.map.get('mock', 'chat-1');
+    assert.ok(b?.sessionId, '会话应建立');
+    assert.equal(creates, 1, '双击 /new 只允许创建一个 agent（并发 /new 必须合并）');
+    assert.equal(mock.sent.filter((m) => m.text?.includes('新会话已创建')).length, 2, '两个 /new 都应收到回执');
+    assert.ok(mock.sent.some((m) => m.text?.includes('合并处理')), '第二个 /new 应说明合并处理');
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：freshSessionId 快速连发不碰撞（round-4 P2-3）', async () => {
+  const { im, teardown } = await setup(QSCRIPT);
+  try {
+    const ids = new Set();
+    for (let i = 0; i < 100; i++) ids.add(im.freshSessionId('mock', 'chat-1'));
+    assert.equal(ids.size, 100, 'freshSessionId 同毫秒快速连发不得碰撞（时间戳+随机后缀）');
+  } finally {
+    await teardown();
+  }
+});
+
 test('回归：/log 宣布段数 = 实际段数，无二次切分（round-2 P2-5）', async () => {
   const { mock, im, teardown } = await setup(QSCRIPT);
   try {

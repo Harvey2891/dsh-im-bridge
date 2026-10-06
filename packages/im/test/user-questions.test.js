@@ -440,6 +440,41 @@ test('回归：多题卡含多选不得承诺"答全自动提交"（round-2 P2-1
   assert.ok(card.text.includes('2.1,2.3'), '多题多选的编号示例必须是点号格式（如 2.1,2.3）');
 });
 
+test('回归：单选票卡不得出现逗号多选示例（round-4 P2-1）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [{ id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }, { label: 'a3' }] }],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+  // 旧版"选项题"行无条件带"多选逗号分隔，如 1,3"——单选卡照抄会返回 invalid
+  assert.ok(!card.text.includes('1,3'), '单选票卡不得出现逗号多选示例（照抄会 invalid）');
+});
+
+test('回归：无多选的多题卡提示行只给点号格式（round-4 P2-1）', async () => {
+  const { a, sent } = makeAnswerer();
+  a.answer(
+    {
+      agent: { id: 'im-mock-c1' },
+      questions: [
+        { id: 'q1', question: 'A?', options: [{ label: 'a1' }, { label: 'a2' }] },
+        { id: 'q2', question: 'B?', options: [{ label: 'b1' }, { label: 'b2' }] },
+      ],
+    },
+    async () => { throw new Error('不该委托'); },
+  );
+  await new Promise((r) => setTimeout(r, 10));
+  const card = sent.find((m) => m.out?.text)?.out;
+  assert.ok(card, '提问卡应已推送');
+  assert.ok(card.text.includes('题号.选项号'), '多题卡提示行必须引导"题号.选项号"格式');
+  assert.ok(!card.text.includes('1,3'), '无多选的多题卡不得出现裸逗号示例（裸编号多题下全落第 1 题）');
+});
+
 test('回归：无多选的多题卡保留"答全自动提交"口径（round-2 P2-1 负向对照）', async () => {
   const { a, sent } = makeAnswerer();
   a.answer(

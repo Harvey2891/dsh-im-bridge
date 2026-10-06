@@ -119,6 +119,8 @@ export class ImRuntime extends Service {
     // sessionId → 最近 turn 是否失败：/retry 只在**失败后**放行（round-2 P2-6）。
     // 此前 /retry 无条件重放 lastUserTexts，成功任务后也会把（可能带写操作的）任务再跑一遍。
     this.lastTurnFailed = new Map();
+    // chatKey → in-flight /new promise：同一聊天的并发 /new 合并处理（round-4 P2-2）。
+    this._newInFlight = new Map();
     this.log = ctx.logger('im');
     this._dispose = [];
     this._ready = this.init();
@@ -786,7 +788,10 @@ export class ImRuntime extends Service {
    * 映射会记住新 id，所以重启后仍能 resume 到最新会话。
    */
   freshSessionId(platform, chatId) {
-    return `${sessionIdFor(platform, chatId)}-${Date.now().toString(36)}`;
+    // 🔴 随机后缀（新计轮 round-4 P2-3）：只靠 Date.now() 在同毫秒并发 /new 会
+    // 碰撞出相同 sessionId，使 sessionId 身份校验失效（失败方会误删同 id 的
+    // 对方绑定）。时间戳保留便于日志肉眼定位。
+    return `${sessionIdFor(platform, chatId)}-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   }
 
   async tryResume(sessionId) {
@@ -998,6 +1003,33 @@ export class ImRuntime extends Service {
   }
 
   async commandNew(msg) {
+    const { platform, chatId } = msg;
+    // 🔴 同一聊天的 /new 串行化（新计轮 round-4 P2-2）：并发 /new（双击）此前会在
+    // disposeAgent/createAgent 的 await 间交错——后者的 map.remove 会删掉前者刚建的
+    // 新绑定（运行中的 agent 失去映射）。现在第一个 /new 走完整流程，并发的 /new
+    // 等它结束后汇报当前状态（双击 /new 应幂等，不建两个会话）。
+    const nk = chatKey(platform, chatId);
+    const prev = this._newInFlight.get(nk);
+    if (prev) {
+      await prev.catch(() => {});
+      const cur = this.map.get(platform, chatId);
+      await this.send({ platform, chatId }, {
+        text: cur
+          ? `✅ 新会话已创建（${cur.sessionId}）。检测到重复的 /new，本次已合并处理。`
+          : '⚠️ 新会话创建未完成，请再发一次 /new 重试。',
+      }).catch(() => {});
+      return;
+    }
+    const run = this._commandNew(msg);
+    this._newInFlight.set(nk, run);
+    try {
+      await run;
+    } finally {
+      this._newInFlight.delete(nk);
+    }
+  }
+
+  async _commandNew(msg) {
     const { platform, chatId, userId } = msg;
     const cfg = this.cfg.security;
     const existing = this.map.get(platform, chatId);
@@ -1028,6 +1060,16 @@ export class ImRuntime extends Service {
     // create 仍会抛 `session "<id>" already exists`。
     const newSessionId = this.freshSessionId(platform, chatId);
     const binding = this.createBinding(platform, chatId, msg.chatType ?? 'private', newSessionId);
+    // 🔴 接管检测（新计轮 round-4 连带）：/new 删旧绑定与建新绑定之间的窗口里，
+    // 并发任务消息（autoCreate）可能抢先建了确定性绑定——map.create 幂等会把
+    // **它的**绑定对象交给我们。此时不得再 createAgent（对方可能已在创建中，
+    // 重名会抛 already exists），只汇报当前状态。
+    if (binding.sessionId !== newSessionId) {
+      await this.send({ platform, chatId }, {
+        text: `ℹ️ 检测到并发消息已创建会话（${binding.sessionId}），/new 沿用该会话。`,
+      }).catch(() => {});
+      return;
+    }
     if (inheritedMuted !== null) {
       binding.muted = true;
       binding.mutedBy = inheritedMuted;
