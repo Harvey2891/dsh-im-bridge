@@ -10,8 +10,21 @@ import { sessionIdFor, chatKey, parseUserKey } from '../lib/message.js';
 test('会话 id 确定性生成（重启不变，FR-2.2）', () => {
   assert.equal(sessionIdFor('telegram', '12345'), sessionIdFor('telegram', '12345'));
   assert.match(sessionIdFor('telegram', '12345'), /^im-telegram-12345$/);
-  // 非法字符净化（尾部的 - 被剥离）
-  assert.match(sessionIdFor('feishu', 'oc_abc!@#'), /^im-feishu-oc_abc$/);
+  // 常规 chatId（字母数字 + -_.）编码与旧格式一致 → 既有会话不受影响
+  assert.equal(sessionIdFor('dingtalk', '9752'), 'im-dingtalk-9752');
+  assert.equal(sessionIdFor('mock', 'chat-1'), 'im-mock-chat-1');
+});
+
+test('会话 id 编码单射：不同 chatId 不得碰撞（round-7 F01）', () => {
+  // 旧实现把这些 chatId 映射到同一 session id → 跨聊天串会话
+  assert.notEqual(sessionIdFor('mock', '12345'), sessionIdFor('mock', '-12345'), '首尾 '-' 差异不得被剥离成同一 id');
+  assert.notEqual(sessionIdFor('mock', 'x-'), sessionIdFor('mock', 'x'));
+  assert.notEqual(sessionIdFor('mock', 'a/b'), sessionIdFor('mock', 'a-b'), '非法字符替换不得碰撞');
+  assert.notEqual(sessionIdFor('mock', 'oc_abc!@#'), sessionIdFor('mock', 'oc_abc'));
+  // 编码可逆 → 不同 chatId 必然不同 id
+  const samples = ['12345', '-12345', 'a b', 'a_b', 'a.b', 'a/b', 'oc_abc!@#', 'x', 'x-'];
+  const ids = new Set(samples.map((c) => sessionIdFor('mock', c)));
+  assert.equal(ids.size, samples.length, '任意两个 chatId 的 session id 必须不同');
 });
 
 test('chatKey / userKey / parseUserKey', () => {
@@ -35,11 +48,12 @@ test('映射：创建 / 反查 / 删除', () => {
   assert.equal(map.size, 0);
 });
 
-test('幂等去重（FR-1.4）', () => {
+test('幂等去重（FR-1.4）：键含 chatId，跨聊天同号不误杀（round-7 F02）', () => {
   const map = new SessionMap(join(tmpdir(), 'im-test'));
-  assert.ok(map.dedupe('telegram', 'm1'));
-  assert.ok(!map.dedupe('telegram', 'm1'));
-  assert.ok(map.dedupe('telegram', 'm2'));
+  assert.ok(map.dedupe('telegram', 'chat-a', 'm1'));
+  assert.ok(!map.dedupe('telegram', 'chat-a', 'm1'), '同聊天同号重复必须去重');
+  assert.ok(map.dedupe('telegram', 'chat-b', 'm1'), '跨聊天同号不得误去重（平台消息号仅聊天内唯一）');
+  assert.ok(map.dedupe('telegram', 'chat-a', 'm2'));
 });
 
 test('持久化：保存后新实例可恢复（UC6 断线恢复）', async () => {

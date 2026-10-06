@@ -419,7 +419,7 @@ export class ImRuntime extends Service {
       this.log.warn(`inbound from unregistered platform "${platform}" ignored | 忽略来自未注册平台的消息`);
       return;
     }
-    if (!this.map.dedupe(platform, msg.msgId)) return; // FR-1.4 幂等去重
+    if (!this.map.dedupe(platform, chatId, msg.msgId)) return; // FR-1.4 幂等去重（键含 chatId：round-7 F02）
 
     // 记录发言者，供出站取平台 userId（钉钉主动推送必须用它）。
     //
@@ -499,11 +499,17 @@ export class ImRuntime extends Service {
       const pureTextCard = textQs.length > 0 && optionQs.length === 0;
       if (pureTextCard && unfilledText && !parseCommand(t)) {
         const r = this.userQuestions.answerText(String(pendingQ.id), t, { platform, chatId });
-        await this.send({ platform, chatId }, {
-          text: r.status === 'partial'
-            ? `📝 已记录提问 #${pendingQ.id} 第 ${(r.qi ?? 0) + 1} 题的文字；还有 ${r.remainingText} 道文字题未答。`
-            : `✅ 已回答提问 #${pendingQ.id}，agent 继续。`,
-        });
+        // 🔴 回执与显式 text 路径共用状态口径（round-7 F05）：needsDone 时
+        // 必须提示 done——否则用户答完最后一题后不知道如何提交，后续普通
+        // 文字会被当新任务。
+        const recLines = r.status === 'partial'
+          ? [
+              `📝 已记录提问 #${pendingQ.id} 第 ${(r.qi ?? 0) + 1} 题的文字`,
+              r.remainingText > 0 ? `还有 ${r.remainingText} 道文字题未答` : null,
+              r.needsDone ? `该卡片含**多选题**，请发 \`/answer ${pendingQ.id} done\` 提交` : null,
+            ].filter(Boolean)
+          : [`✅ 已回答提问 #${pendingQ.id}，agent 继续。`];
+        await this.send({ platform, chatId }, { text: recLines.join('；') + '。' });
         return;
       }
     }
@@ -570,7 +576,7 @@ export class ImRuntime extends Service {
           // 这里若仍写"请直接回复文字"会把用户导向错误入口（round-n1 F09）。
           const needs = [];
           if (acc.needsText) needs.push(`发 \`/answer ${qid} text <内容>\` 回答文字题`);
-          if (acc.needsDone) needs.push('多选题可继续点，完成后发 `/answer ${qid} done` 提交');
+          if (acc.needsDone) needs.push(`多选题可继续点，完成后发 \`/answer ${qid} done\` 提交`);
           const hint = needs.length
             ? `\n${needs.join('；')}。`
             : `\n进度 ${acc.answered}/${acc.total}——继续点其余题，或发 \`/answer ${qid} done\` 直接提交。`;

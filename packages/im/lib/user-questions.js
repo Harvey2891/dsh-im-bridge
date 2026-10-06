@@ -41,6 +41,10 @@ export class UserQuestionAnswerer {
       enabled: cfg.enabled ?? true,
       // 0 = 无限等待（与 ask_user_question 的默认语义一致：默认等待）
       timeoutSec: cfg.timeoutSec ?? 0,
+      // 🔴 发送阶段看门狗（新计轮 round-7 F04）：卡片推送挂起（send 既不
+      // resolve 也不 reject）时 fail closed 的时限。默认 60s，与
+      // approvals.js 的发送看门狗同口径。
+      sendTimeoutSec: cfg.sendTimeoutSec ?? 60,
     };
     /** @type {Map<string, object>} questionId → record */
     this.records = new Map();
@@ -168,9 +172,31 @@ export class UserQuestionAnswerer {
     // 🔴 卡片推送**不能 await**：若在这里 `await send`，waterfall 监听器本身就被
     // 卡在发送上，abort/取消只能等 send 返回后才被处理 —— 发送一旦挂起就是永久等待。
     // 改为「发起发送、立即返回 record.promise」，让 abort 能即时生效。
+    //
+    // 🔴 发送阶段看门狗（新计轮 round-7 F04）：send **挂起**（既不 resolve 也不
+    // reject，如渠道栈卡死）时上面的 .catch 永远不会触发，而默认 timeoutSec=0
+    // 又无 abort 救援——记录永久挂起：agent 任务卡死、会话卡死、用户连卡片
+    // 都没收到。加独立超时：到期 fail closed（UNAVAILABLE + 空答案），让 agent
+    // 得知投递失败自行决定；若渠道只是慢（卡片迟至送达），用户稍后作答会收到
+    // "提问不存在"——可接受：明确知道投递失败好过无声地永久等待。
+    // 发送成功（卡片已出）则清除看门狗，恢复"无限等待用户"语义。
     const card = this.renderCard(record);
+    const sendTimeoutSec = Number(this.cfg.sendTimeoutSec);
+    let sendWatchdog = null;
+    if (Number.isFinite(sendTimeoutSec) && sendTimeoutSec > 0) {
+      sendWatchdog = setTimeout(() => {
+        sendWatchdog = null;
+        this.logLine(`question ${id} push watchdog: send 挂起 ${sendTimeoutSec}s → fail closed`);
+        this._settle(id, STATE.UNAVAILABLE, { answers: [] });
+      }, Math.max(1, Math.round(sendTimeoutSec * 1000)));
+      sendWatchdog.unref?.();
+    }
     void this.send({ platform: binding.platform, chatId: binding.chatId }, card)
+      .then(() => {
+        if (sendWatchdog) { clearTimeout(sendWatchdog); sendWatchdog = null; }
+      })
       .catch((err) => {
+        if (sendWatchdog) { clearTimeout(sendWatchdog); sendWatchdog = null; }
         // 推送失败 → fail closed，不阻塞 agent
         this.logLine(`question ${id} push failed: ${err?.message ?? err}`);
         this._settle(id, STATE.UNAVAILABLE, { answers: [] });

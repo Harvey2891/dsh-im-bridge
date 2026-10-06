@@ -229,6 +229,49 @@ test('回归：id 不回绕复用（旧等待记录不被覆盖）', async () =>
   await p1;
 });
 
+test('回归：卡片发送挂起（无 abort）→ 发送看门狗 fail closed（round-7 F04）', async () => {
+  // 默认 timeoutSec=0（无限等用户）+ 非 timed（无 DSH abort 救援）+ send 永不 settle
+  // → 旧实现记录永久挂起（agent 任务卡死、用户没收到卡片）。
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: () => new Promise(() => {}), // 永不 resolve/reject
+    logLine: () => {},
+    cfg: { sendTimeoutSec: 0.05 },
+  });
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: REQ.questions },
+    async () => { throw new Error('不该委托'); },
+  );
+  const r = await Promise.race([
+    p,
+    new Promise((res) => setTimeout(() => res('__timeout__'), 2000)),
+  ]);
+  assert.notEqual(r, '__timeout__', '看门狗到期必须让 promise 落地，不得挂死');
+  assert.deepEqual(r, { answers: [] }, 'fail closed：空答案让 agent 得知投递失败');
+  assert.equal(a.records.size, 0, '结算后不得残留等待记录');
+});
+
+test('回归：发送成功清除看门狗（慢发送不触发 fail closed）', async () => {
+  // send 在 30ms 后成功（早于 50ms 看门狗）→ 必须无限等用户，看门狗被清除
+  const a = new UserQuestionAnswerer({
+    ctx: { on: () => () => {}, get: () => undefined },
+    map: { bySessionId: () => ({ platform: 'mock', chatId: 'c1' }) },
+    send: async () => { await new Promise((r) => setTimeout(r, 30)); },
+    logLine: () => {},
+    cfg: { sendTimeoutSec: 0.05 },
+  });
+  const p = a.answer(
+    { agent: { id: 'im-mock-c1' }, questions: REQ.questions },
+    async () => { throw new Error('不该委托'); },
+  );
+  // 等过看门狗时限：若看门狗未被清除，p 会在此前 resolve 成 {answers:[]}
+  await new Promise((r) => setTimeout(r, 120));
+  assert.equal(a.records.size, 1, '发送成功且未超时应继续等待用户（看门狗已清除）');
+  assert.equal(a.respond('01', [{ qIndex: 0, oIndex: 0 }]), 'answered');
+  await p;
+});
+
 test('回归：发送挂起期间 abort 必须 reject（不得永久等待）', async () => {
   let releaseSend;
   const sendGate = new Promise((r) => { releaseSend = r; });

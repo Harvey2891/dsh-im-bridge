@@ -1225,6 +1225,54 @@ test('回归：多题卡分次手打编号——合法部分答案回执"已记�
   }
 });
 
+test('回归：多选按钮回执必须插值真实提问 ID（round-7 F03）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '选几个？', options: [{ label: 'a' }, { label: 'b' }, { label: 'c' }], multiSelect: true },
+    ]);
+    mock.reset();
+    await im.handleCallback({ platform: 'mock', chatId: 'chat-1', userId: 'user-1', data: `q:${qid}:0:0` });
+
+    const m = mock.sent.find((x) => x.text?.includes('已记录'));
+    assert.ok(m, '按钮点击应有回执');
+    assert.ok(!m.text.includes('${qid}'), '回执不得含未插值的 ${qid} 字面量（照抄会得到无效命令）');
+    assert.ok(m.text.includes(`/answer ${qid} done`), '回执的提交命令必须含真实提问 ID');
+    // 注意：多选卡停在等待 done 状态，p 不会 resolve——不得 await（teardown 清理）
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：multiSelect 文字卡直接回复的回执提示 done（round-7 F05）', async () => {
+  const { mock, im, teardown } = await setup(QSCRIPT);
+  try {
+    await mock.sendFromUser({ text: '你好' });
+    await waitFor(() => im.map.get('mock', 'chat-1')?.sessionId, { label: 'binding', timeoutMs: 8000 });
+
+    const { p, qid } = await pushQuestion(im, [
+      { id: 'q1', question: '叫什么名字？', multiSelect: true }, // 文字题 + multiSelect（特殊组合）
+    ]);
+    mock.reset();
+    await mock.sendFromUser({ text: '张三' });
+
+    const m = mock.sent.find((x) => x.text?.includes('已记录'));
+    assert.ok(m, '直接文字回复应有回执');
+    assert.ok(m.text.includes(`/answer ${qid} done`), '含 multiSelect 的回执必须提示 done（否则用户卡在无入口状态）');
+    assert.equal(im.userQuestions.records.size, 1, 'multiSelect 卡不得自动结题');
+
+    mock.reset();
+    await im.commandAnswer({ platform: 'mock', chatId: 'chat-1', userId: 'user-1' }, [qid, 'done']);
+    const ans = await p;
+    assert.ok(JSON.stringify(ans).includes('张三'), '文字答案必须经 done 提交');
+  } finally {
+    await teardown();
+  }
+});
+
 test('回归：/new 双击合并处理（同聊天串行化，round-4 P2-2）', async () => {
   const { mock, im, teardown } = await setup(QSCRIPT);
   try {

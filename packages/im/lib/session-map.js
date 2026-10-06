@@ -142,10 +142,15 @@ export class SessionMap {
     return this.chats.size;
   }
 
-  /** 幂等去重：msgId 已处理过返回 false，否则记录并返回 true。 */
-  dedupe(platform, msgId, limit = 1000) {
+  /** 幂等去重：(chatId, msgId) 已处理过返回 false，否则记录并返回 true。
+   *
+   * 🔴 键必须含 chatId（新计轮 round-7 F02）：平台消息号（如 Telegram
+   * message_id）只在**所属聊天内**唯一——键里只有 platform:msgId 时，两个聊天
+   * 的同号消息会把后到者静默丢弃（任务/命令/答案全丢，无任何回执）。
+   */
+  dedupe(platform, chatId, msgId, limit = 1000) {
     if (!msgId) return true;
-    const key = `${platform}:${msgId}`;
+    const key = `${platform}:${chatId}:${msgId}`;
     if (this.seen.has(key)) return false;
     this.seen.set(key, Date.now());
     if (this.seen.size > limit) {
