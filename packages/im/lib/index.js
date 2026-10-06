@@ -82,6 +82,11 @@ const Config = z.object({
     enabled: z.boolean().default(true),
     // 0 = 无限等待（对齐 ask_user_question 默认「等待用户」语义）
     timeoutSec: z.number().default(0),
+    // 🔴 发送阶段看门狗（round-7 F04）：卡片推送挂起时 fail closed 的时限（秒）。
+    // 0 = 禁用看门狗（恢复"发送挂起即无限等待"旧行为，不推荐）。
+    // 注意：此前漏声明此字段，Zod 会把配置里的值**剥离**，生产环境永远回落
+    // 构造器默认 60s（round-8 P3）。
+    sendTimeoutSec: z.number().min(0).default(60),
   }),
 });
 

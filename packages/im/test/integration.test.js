@@ -106,6 +106,7 @@ async function setup(script, cfgOverrides = {}) {
     approvals: { ...MOCK_CFG.approvals, ...(cfgOverrides.approvals ?? {}) },
     notifications: { ...MOCK_CFG.notifications, ...(cfgOverrides.notifications ?? {}) },
     agent: { ...MOCK_CFG.agent, ...(cfgOverrides.agent ?? {}) },
+    userQuestions: { ...(MOCK_CFG.userQuestions ?? {}), ...(cfgOverrides.userQuestions ?? {}) },
     storeDir,
   };
   const imHandle = ctx.plugin(ImRuntime, mergedCfg);
@@ -128,6 +129,39 @@ async function setup(script, cfgOverrides = {}) {
     },
   };
 }
+
+// ── 回归：userQuestions.sendTimeoutSec 必须进入配置 schema（round-8 P3）──────
+// 此前 schema 漏声明该字段：部署者配置的值被配置解析剥离，生产环境永远回落
+// 构造器默认 60s（看门狗无法按部署者意图调整/关闭）。验证以**真实插件挂载**
+// 为准：配置值必须原样到达 UserQuestionAnswerer.cfg。
+
+test('回归：userQuestions.sendTimeoutSec 经插件挂载透传（round-8 P3）', async () => {
+  const { im, teardown } = await setup(QSCRIPT, {
+    userQuestions: { sendTimeoutSec: 10 },
+  });
+  try {
+    assert.equal(
+      im.userQuestions.cfg.sendTimeoutSec,
+      10,
+      '配置的值必须保留到应答器，不能被 schema 剥离',
+    );
+  } finally {
+    await teardown();
+  }
+});
+
+test('回归：userQuestions.sendTimeoutSec 缺省 60s（round-8 P3）', async () => {
+  const { im, teardown } = await setup(QSCRIPT);
+  try {
+    assert.equal(
+      im.userQuestions.cfg.sendTimeoutSec,
+      60,
+      '缺省 60s（与构造器默认一致）',
+    );
+  } finally {
+    await teardown();
+  }
+});
 
 // ── 回归：IM agent 必须挂载 agent preset ────────────────────────────────────
 //
